@@ -25,7 +25,11 @@ from ftw_dataset_tools.api.imagery.parallel import (
     run_in_parallel,
 )
 from ftw_dataset_tools.api.imagery.scene_selection import SelectedScene
-from ftw_dataset_tools.api.imagery.sources import DEFAULT_SOURCE, build_source
+from ftw_dataset_tools.api.imagery.sources import (
+    DEFAULT_SOURCE,
+    SourceUnavailableError,
+    build_source,
+)
 from ftw_dataset_tools.api.imagery.thumbnails import has_rgb_bands
 
 if TYPE_CHECKING:
@@ -326,6 +330,8 @@ def _record_download(
     """
     task = outcome.task
 
+    if isinstance(outcome.error, SourceUnavailableError):
+        raise outcome.error
     if outcome.error is not None:
         result.failed += 1
         result.failed_details.append({"item": task.item.id, "error": str(outcome.error)})

@@ -8,6 +8,7 @@ import click
 
 from ftw_dataset_tools.api import assets, crop_stats, masks, pipeline, source
 from ftw_dataset_tools.api import config as config_module
+from ftw_dataset_tools.api.imagery.sources import ImagerySourceError
 
 
 def _on_progress(msg: str) -> None:
@@ -172,6 +173,7 @@ def run_cmd(
         pipeline.StageInputError,
         assets.MaskReadError,
         source.SourceFetchError,
+        ImagerySourceError,
     ) as err:
         click.echo(click.style(f"\nError: {err}", fg="red"))
         raise SystemExit(1) from err

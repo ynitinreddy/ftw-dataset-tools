@@ -15,7 +15,12 @@ from ftw_dataset_tools.api.imagery import (
     select_imagery_for_catalog,
 )
 from ftw_dataset_tools.api.imagery.parallel import DEFAULT_WORKERS, MAX_WORKERS
-from ftw_dataset_tools.api.imagery.sources import DEFAULT_SOURCE, SOURCE_NAMES, build_source
+from ftw_dataset_tools.api.imagery.sources import (
+    DEFAULT_SOURCE,
+    SOURCE_NAMES,
+    ImagerySourceError,
+    build_source,
+)
 from ftw_dataset_tools.api.pipeline import docs_summary_line
 from ftw_dataset_tools.api.stac import detect_datetime_column, get_year_from_datetime_column
 
@@ -521,7 +526,7 @@ def create_dataset_cmd(
         sys.stdout.write("\n")
         click.echo(click.style("Interrupted by user.", fg="yellow"))
         raise SystemExit(130) from None
-    except (FileNotFoundError, ValueError, RuntimeError, MaskReadError) as e:
+    except (FileNotFoundError, ValueError, RuntimeError, MaskReadError, ImagerySourceError) as e:
         click.echo(click.style(f"\nError: {e}", fg="red"))
         raise SystemExit(1) from e
 

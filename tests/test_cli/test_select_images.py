@@ -321,6 +321,35 @@ class TestSelectImagesCropCalendarWarmup:
         assert seen["source"].bundle == "analytic_8b_sr_udm2"
         assert seen["record_candidates"] is True
 
+    @pytest.mark.usefixtures("crop_calendar_warmup")
+    def test_missing_planet_key_stops_the_run_once(self, tmp_path: Path, monkeypatch) -> None:
+        from types import SimpleNamespace
+
+        from ftw_dataset_tools.api.imagery import scene_selection
+        from ftw_dataset_tools.api.imagery.crop_calendar import CropCalendarDates
+        from ftw_dataset_tools.api.imagery.sources import planetscope
+
+        dataset_dir = tmp_path / "dataset"
+        dataset_dir.mkdir()
+        _write_minimal_collection(dataset_dir / "collection.json")
+        for chip_id in ("ftw-item1", "ftw-item2"):
+            _write_chip_item(dataset_dir / "chips" / "33UXP" / chip_id, chip_id)
+        monkeypatch.delenv("PL_API_KEY", raising=False)
+        monkeypatch.setattr(planetscope, "_CLIENTS", SimpleNamespace())
+        monkeypatch.setattr(
+            scene_selection,
+            "get_crop_calendar_dates",
+            lambda _bbox, on_progress=None: CropCalendarDates(100, 200),  # noqa: ARG005
+        )
+
+        result = CliRunner().invoke(
+            cli,
+            ["select-images", str(dataset_dir), "--year", "2023", "--source", "planetscope"],
+        )
+
+        assert result.exit_code == 1
+        assert result.output.count("PL_API_KEY") == 1
+
     def test_no_warmup_when_nothing_to_process(self, tmp_path: Path, crop_calendar_warmup) -> None:
         """A catalog whose only chip is skipped up front never touches the network."""
         dataset_dir = tmp_path / "dataset"

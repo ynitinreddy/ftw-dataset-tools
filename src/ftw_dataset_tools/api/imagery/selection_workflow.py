@@ -30,7 +30,7 @@ from ftw_dataset_tools.api.imagery.parallel import (
 )
 from ftw_dataset_tools.api.imagery.progress import ImageryProgressBar
 from ftw_dataset_tools.api.imagery.scene_selection import select_scenes_for_chip
-from ftw_dataset_tools.api.imagery.sources import Sentinel2Source
+from ftw_dataset_tools.api.imagery.sources import Sentinel2Source, SourceUnavailableError
 from ftw_dataset_tools.api.imagery.stac_child_items import create_child_items_from_selection
 
 if TYPE_CHECKING:
@@ -333,7 +333,7 @@ def _record_chip(
         progress.on_progress(message)
 
     if outcome.error is not None:
-        if on_missing == "fail":
+        if on_missing == "fail" or isinstance(outcome.error, SourceUnavailableError):
             raise outcome.error
         result.failed += 1
         result.failed_details.append({"chip": job.item.id, "error": str(outcome.error)})

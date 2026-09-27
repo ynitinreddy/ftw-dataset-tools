@@ -36,6 +36,7 @@ from ftw_dataset_tools.api.imagery.sources import (
     DEFAULT_SOURCE,
     PLANET_BUNDLES,
     SOURCE_NAMES,
+    SourceUnavailableError,
     build_source,
 )
 from ftw_dataset_tools.api.stac_items import copy_catalog
@@ -97,6 +98,8 @@ def _record_chip(
     for message in job.logs:
         progress.on_progress(message)
 
+    if isinstance(outcome.error, SourceUnavailableError):
+        raise click.ClickException(str(outcome.error)) from outcome.error
     if outcome.error is not None:
         if on_missing == "fail":
             raise outcome.error
