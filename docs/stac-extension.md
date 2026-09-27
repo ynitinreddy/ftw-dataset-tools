@@ -58,22 +58,32 @@ is a different denominator from `ftw:field_coverage_pct`, which is a share of th
 own area: a chip that is 20% fields, all of them wheat, has
 `ftw:field_coverage_pct: 20` and `ftw:hcat_dominant_pct: 100`.
 
-### Child S2 Item Properties
+### Child Season Item Properties
 
-These properties are added to child Sentinel-2 items (planting and harvest):
+These properties are added to each season child item (`{item_id}_{season}_{suffix}`, where the
+suffix is `s2` for Sentinel-2 and `planet` for PlanetScope):
 
 | Property | Type | Description |
 |----------|------|-------------|
 | `ftw:season` | string | Season identifier: "planting" or "harvest" |
-| `ftw:source` | string | Image source identifier: "sentinel-2" |
+| `ftw:source` | string | Imagery source: "sentinel-2" or "planetscope" |
 | `ftw:calendar_year` | integer | Calendar year for the crop cycle |
-| `ftw:cloud_cover_source` | string | Source of cloud cover value: "scene" or "pixel" |
+| `ftw:scene_id` | string | Id of the source scene the chip is cut from |
+| `ftw:scene_cloud_cover` | number | Whole-scene cloud cover percentage from the scene metadata |
+| `ftw:cloud_cover_source` | string | How `eo:cloud_cover` was measured: "pixel" or "scene" (metadata fallback) |
+| `ftw:cloud_mask` | string | Mask used for the pixel measurement: "scl" (Sentinel-2) or "udm2" (PlanetScope) |
+| `ftw:nodata_pct` | number | Nodata percentage in the chip window, when measured |
+| `ftw:buffer_used` | integer | Search buffer in days that produced this scene |
+| `ftw:clear_candidates` | array | With `--record-candidates`: every clear scene in the window, `{scene_id, datetime, cloud_cover}` |
+| `ftw:planet_bundle`, `ftw:planet_order_id`, `ftw:harmonized` | | PlanetScope order bookkeeping |
 
-Standard EO extension property:
+Standard properties: `eo:cloud_cover` (cloud cover over the chip footprint, rounded to 2 decimal
+places), `platform`, `constellation`, `instruments` and `gsd`. Clipped GeoTIFFs also carry the
+`FTW_SOURCE`, `FTW_SCENE_ID`, `FTW_DATETIME` and `FTW_CHIP_CLOUD_COVER` metadata tags.
 
-| Property | Type | Description |
-|----------|------|-------------|
-| `eo:cloud_cover` | number | Cloud cover percentage of the source scene, rounded to 2 decimal places |
+Parent `ftw:planting` / `ftw:harvest` links carry an `ftw:source` field; links without one are
+Sentinel-2. Sentinel-2 imagery keeps the `planting_image` / `harvest_image` asset keys, other
+sources add their suffix (`planting_image_planet`).
 
 ### Collection Properties
 

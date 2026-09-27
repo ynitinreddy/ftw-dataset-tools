@@ -51,6 +51,7 @@ from ftw_dataset_tools.api.imagery import (
     select_imagery_for_catalog,
 )
 from ftw_dataset_tools.api.imagery.preview_workflow import preview_imagery_for_catalog
+from ftw_dataset_tools.api.imagery.sources import build_source
 from ftw_dataset_tools.api.masks import MaskType
 from ftw_dataset_tools.api.source import (
     describe_local_source,
@@ -759,7 +760,7 @@ def stage_stac(ctx: PipelineContext) -> None:
 
 
 def stage_select_images(ctx: PipelineContext) -> None:
-    """Select cloud-free Sentinel-2 scenes for each chip."""
+    """Select cloud-free scenes from the configured imagery source for each chip."""
     _require(ctx.output_dir / "collection.json", stage="select_images", produced_by="stac")
     if ctx.effective_year is None:
         raise ValueError("A year is required for image selection.")
@@ -776,6 +777,13 @@ def stage_select_images(ctx: PipelineContext) -> None:
         buffer_expansion_size=select_cfg.buffer_expansion_size,
         workers=select_cfg.effective_workers,
         search_backend=select_cfg.search_backend,
+        source=build_source(
+            select_cfg.source,
+            s2_collection=select_cfg.s2_collection,
+            search_backend=select_cfg.search_backend,
+            planet_bundle=select_cfg.planet_bundle,
+        ),
+        record_candidates=select_cfg.record_candidates,
     )
 
 
@@ -808,6 +816,7 @@ def stage_download_images(ctx: PipelineContext) -> None:
         # to fetch. Set stages.download_images.resume false to force a re-download,
         # which is what a changed `bands` or `resolution` needs.
         resume=download_cfg.resume,
+        source_options=download_cfg.source_options(),
     )
 
 

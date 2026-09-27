@@ -30,6 +30,14 @@ from ftw_dataset_tools.api.imagery.selection_workflow import (
     ChipSelectionJob,
     run_chip_selection,
 )
+from ftw_dataset_tools.api.imagery.settings import S2_COLLECTIONS
+from ftw_dataset_tools.api.imagery.sources import (
+    DEFAULT_BUNDLE,
+    DEFAULT_SOURCE,
+    PLANET_BUNDLES,
+    SOURCE_NAMES,
+    build_source,
+)
 from ftw_dataset_tools.api.stac_items import copy_catalog
 
 if TYPE_CHECKING:
@@ -121,6 +129,33 @@ def _record_chip(
 @click.command("select-images")
 @click.argument("input_path", type=click.Path(exists=True))
 @click.option(
+    "--source",
+    type=click.Choice(SOURCE_NAMES),
+    default=DEFAULT_SOURCE,
+    show_default=True,
+    help="Imagery source. planetscope needs the [planet] extra and PL_API_KEY.",
+)
+@click.option(
+    "--s2-collection",
+    type=click.Choice(list(S2_COLLECTIONS)),
+    default="c1",
+    show_default=True,
+    help="Sentinel-2 collection (sentinel-2 source only).",
+)
+@click.option(
+    "--planet-bundle",
+    type=click.Choice(list(PLANET_BUNDLES)),
+    default=DEFAULT_BUNDLE,
+    show_default=True,
+    help="Planet order bundle (planetscope source only).",
+)
+@click.option(
+    "--record-candidates",
+    is_flag=True,
+    default=False,
+    help="Check every candidate scene and record all clear ones on each season item.",
+)
+@click.option(
     "--year",
     type=int,
     default=None,
@@ -179,15 +214,15 @@ def _record_chip(
     type=click.Choice(["parquet", "earth-search"]),
     default="parquet",
     show_default=True,
-    help="Scene search backend: the Sentinel-2 STAC-GeoParquet mirror (no API, "
-    "no rate limit) or the Earth Search STAC API.",
+    help="Scene search backend (sentinel-2 source only): the Sentinel-2 "
+    "STAC-GeoParquet mirror (no API, no rate limit) or the Earth Search STAC API.",
 )
 @click.option(
     "--workers",
     type=click.IntRange(1, MAX_WORKERS),
     default=None,
     help="Chips to select for concurrently. Defaults to 16 for the parquet "
-    "backend and 4 for earth-search (which rate-bans aggressive clients).",
+    "backend and 4 for earth-search (which rate-bans aggressive clients) and planetscope.",
 )
 @click.option(
     "--output-report",
@@ -223,6 +258,10 @@ def _record_chip(
 )
 def select_images_cmd(
     input_path: str,
+    source: str,
+    s2_collection: str,
+    planet_bundle: str,
+    record_candidates: bool,
     year: int | None,
     cloud_cover_chip: float,
     nodata_max: float,
@@ -239,15 +278,16 @@ def select_images_cmd(
     show_stats: bool,
     clear_selections: bool,
 ) -> None:
-    """Select optimal Sentinel-2 imagery for chips.
+    """Select cloud-free imagery for chips.
 
-    Finds cloud-free Sentinel-2 scenes for each chip based on crop calendar
-    dates (planting and harvest), searching the Sentinel-2 STAC-GeoParquet
-    mirror by default (--search-backend earth-search queries the Earth Search
-    API instead). Creates child STAC items with remote asset links.
+    Finds cloud-free scenes from --source for each chip based on crop calendar
+    dates (planting and harvest). Sentinel-2 searches its STAC-GeoParquet mirror
+    by default (--search-backend earth-search queries the Earth Search API
+    instead); planetscope searches the Planet Data API. Creates one child STAC
+    item per season recording the scene, its date and its cloud cover.
 
-    By default, chips that already have imagery selections are skipped.
-    Use --force to overwrite existing selections.
+    By default, chips that already have imagery selections from the source are
+    skipped. Use --force to overwrite existing selections.
 
     \b
     INPUT_PATH: One of:
@@ -260,11 +300,18 @@ def select_images_cmd(
         ftwd select-images ./my-dataset/chips/33UXP/ftw-34UFF1628_2024/ftw-34UFF1628_2024.json -v
         ftwd select-images ./my-dataset --year 2023 --cloud-cover-chip 5
         ftwd select-images ./my-dataset --force  # Overwrite existing selections
+        ftwd select-images ./my-dataset --source planetscope --year 2023
     """
     input_path_obj = Path(input_path)
+    image_source = build_source(
+        source,
+        s2_collection=s2_collection,
+        search_backend=search_backend,
+        planet_bundle=planet_bundle,
+    )
 
     if workers is None:
-        workers = default_selection_workers(search_backend)
+        workers = default_selection_workers(search_backend, source)
 
     # Determine if input is a single chip JSON or a catalog directory
     single_chip_mode = input_path_obj.suffix == ".json"
@@ -325,7 +372,7 @@ def select_images_cmd(
 
     # Handle --show-stats mode
     if show_stats:
-        stats = get_imagery_stats(chip_items)
+        stats = get_imagery_stats(chip_items, source)
         click.echo(f"\nImagery Selection Statistics for {catalog_dir}")
         click.echo("=" * 50)
         click.echo(f"Total chips: {stats.total}")
@@ -348,13 +395,14 @@ def select_images_cmd(
 
     # Handle --clear-selections mode
     if clear_selections:
-        stats = get_imagery_stats(chip_items)
+        stats = get_imagery_stats(chip_items, source)
 
         if stats.with_imagery == 0:
-            click.echo("No chips have imagery selections to clear.")
+            click.echo(f"No chips have {source} imagery selections to clear.")
             return
 
         click.echo(click.style("\nWARNING: This will permanently delete:", fg="red", bold=True))
+        click.echo(f"  (only {source} selections)")
         click.echo(f"  - {stats.with_imagery} planting scene STAC items")
         click.echo(f"  - {stats.with_imagery} harvest scene STAC items")
         click.echo("  - Any downloaded GeoTIFF imagery files")
@@ -372,8 +420,8 @@ def select_images_cmd(
 
         with tqdm(total=len(chip_items), desc="Clearing selections", unit="chip") as pbar:
             for item in chip_items:
-                if has_existing_scenes(item):
-                    result = clear_chip_selections(item)
+                if has_existing_scenes(item, source):
+                    result = clear_chip_selections(item, source)
                     total_stac += result.stac_items_deleted
                     total_tifs += result.geotiffs_deleted
                     chips_cleared += 1
@@ -386,6 +434,7 @@ def select_images_cmd(
         click.echo(f"  GeoTIFF files deleted: {total_tifs}")
         return
 
+    click.echo(f"Source: {source}")
     if year:
         click.echo(f"Year: {year} (from --year option)")
     else:
@@ -413,7 +462,7 @@ def select_images_cmd(
             continue
 
         # Skip chips that already have scene selections (unless --force)
-        if not force and has_existing_scenes(item):
+        if not force and has_existing_scenes(item, source):
             skipped.append({"chip": chip_id, "reason": "Already has imagery selections"})
             already_has_count += 1
             continue
@@ -471,6 +520,8 @@ def select_images_cmd(
             num_buffer_expansions=num_buffer_expansions,
             buffer_expansion_size=buffer_expansion_size,
             search_backend=search_backend,
+            source=image_source,
+            record_candidates=record_candidates,
         )
 
     with ImageryProgressBar(total=len(jobs), leave=True, verbose=verbose) as progress:
@@ -493,7 +544,7 @@ def select_images_cmd(
     other_skipped = [s for s in skipped if s not in already_has and s not in no_scenes]
 
     # Get final stats
-    final_stats = get_imagery_stats(chip_items)
+    final_stats = get_imagery_stats(chip_items, source)
 
     # Print summary
     click.echo("\n" + "=" * 50)
@@ -537,6 +588,7 @@ def select_images_cmd(
             "skipped": skipped,
             "failed": failed,
             "parameters": {
+                "source": source,
                 "year": year if year else "extracted_from_chip_ids",
                 "cloud_cover_chip": cloud_cover_chip,
                 "buffer_days": buffer_days,

@@ -686,6 +686,50 @@ class TestImageryWorkers:
         assert stages["download_images"]["workers"] == 4
 
 
+class TestImagerySourceConfig:
+    """Tests for stages.select_images.source and its per-source options."""
+
+    def test_defaults_to_sentinel_2(self) -> None:
+        config = DatasetConfig.from_dict({"fields_file": "f.parquet"})
+        assert config.stages.select_images.source == "sentinel-2"
+        assert config.stages.select_images.record_candidates is False
+
+    def test_planetscope_accepted_with_its_worker_default(self) -> None:
+        config = DatasetConfig.from_dict(
+            {
+                "fields_file": "f.parquet",
+                "stages": {
+                    "select_images": {"source": "planetscope", "planet_bundle": "analytic_sr_udm2"},
+                    "download_images": {"planet_wait": False},
+                },
+            }
+        )
+        assert config.stages.select_images.effective_workers == 4
+        assert config.stages.download_images.source_options()["planet_wait"] is False
+
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [("source", "landsat"), ("s2_collection", "c2"), ("planet_bundle", "visual")],
+    )
+    def test_invalid_choice_raises(self, key: str, value: str) -> None:
+        with pytest.raises(ConfigError, match=key):
+            DatasetConfig.from_dict(
+                {"fields_file": "f.parquet", "stages": {"select_images": {key: value}}}
+            )
+
+    def test_preview_mode_needs_the_default_source(self) -> None:
+        with pytest.raises(ConfigError, match="preview"):
+            DatasetConfig.from_dict(
+                {
+                    "fields_file": "f.parquet",
+                    "stages": {
+                        "select_images": {"source": "planetscope"},
+                        "download_images": {"mode": "preview"},
+                    },
+                }
+            )
+
+
 class TestSearchBackendConfig:
     """Tests for stages.select_images.search_backend and worker defaults."""
 

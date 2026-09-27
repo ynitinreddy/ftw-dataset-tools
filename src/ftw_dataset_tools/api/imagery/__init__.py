@@ -18,6 +18,7 @@ from ftw_dataset_tools.api.imagery.crop_calendar import (
 from ftw_dataset_tools.api.imagery.download_workflow import (
     DownloadWorkflowResult,
     download_imagery_for_catalog,
+    find_child_items,
     find_s2_child_items,
 )
 from ftw_dataset_tools.api.imagery.image_download import (
@@ -79,6 +80,7 @@ __all__ = [
     "create_child_items_from_selection",
     "download_and_clip_scene",
     "download_imagery_for_catalog",
+    "find_child_items",
     "find_chip_items",
     "find_collection_dir",
     "find_s2_child_items",

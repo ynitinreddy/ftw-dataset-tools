@@ -489,6 +489,20 @@ def _build_item_assets() -> dict[str, ItemAssetDefinition]:
                 "title": f"{season.capitalize()} season scene (true colour)",
             }
         )
+    from ftw_dataset_tools.api.imagery.naming import parent_asset_key
+    from ftw_dataset_tools.api.imagery.sources import DEFAULT_SOURCE, SOURCES
+
+    for name, source in SOURCES.items():
+        if name == DEFAULT_SOURCE:
+            continue
+        for season in ("planting", "harvest"):
+            defs[parent_asset_key(season, "image", name)] = ItemAssetDefinition(
+                {
+                    "type": MEDIA_TYPE_COG,
+                    "roles": ["data"],
+                    "title": f"{season.capitalize()} season {source.title} imagery",
+                }
+            )
     defs["thumbnail"] = ItemAssetDefinition(
         {"type": MEDIA_TYPE_WEBP, "roles": ["thumbnail"], "title": "Chip preview"}
     )

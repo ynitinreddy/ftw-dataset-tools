@@ -121,6 +121,8 @@ def update_parent_item(
     band_list: list[str],
     thumbnail_filename: str | None = None,
     is_overlay: bool = False,
+    asset_key: str | None = None,
+    source_title: str | None = None,
 ) -> None:
     """Update parent item with reference to downloaded image.
 
@@ -136,6 +138,8 @@ def update_parent_item(
         thumbnail_filename: Optional thumbnail filename. If provided and season is
             "planting", adds as the chip's thumbnail asset.
         is_overlay: If True, thumbnail has mask overlay (used for title).
+        asset_key: Parent asset key for the image (default ``<season>_image``).
+        source_title: Imagery source named in the asset title, if not the default.
 
     Raises:
         STACSaveError: If the save operation fails
@@ -145,7 +149,8 @@ def update_parent_item(
     # whichever of the two is loaded first.
     from ftw_dataset_tools.api.imagery.thumbnails import preview_media_type
 
-    asset_key = f"{season}_image"
+    asset_key = asset_key or f"{season}_image"
+    label = " ".join(filter(None, [season.capitalize(), "season", source_title, "imagery"]))
     added_thumbnail = False
 
     try:
@@ -154,7 +159,7 @@ def update_parent_item(
             pystac.Asset(
                 href=f"./{output_filename}",
                 media_type="image/tiff; application=geotiff; profile=cloud-optimized",
-                title=f"{season.capitalize()} season imagery ({','.join(band_list)})",
+                title=f"{label} ({','.join(band_list)})",
                 roles=["data"],
             ),
         )

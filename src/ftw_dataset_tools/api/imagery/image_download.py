@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
@@ -15,11 +16,10 @@ from rasterio.vrt import WarpedVRT
 from rasterio.warp import Resampling
 
 from ftw_dataset_tools.api.assets import add_file_info, add_raster_bands
-from ftw_dataset_tools.api.imagery.settings import (
-    BANDS_OF_INTEREST,
-    CHILD_ITEM_BAND_ASSETS,
-    REFLECTANCE_BANDS,
-)
+from ftw_dataset_tools.api.imagery.naming import parent_asset_key, parse_image_stem
+from ftw_dataset_tools.api.imagery.settings import BANDS_OF_INTEREST, REFLECTANCE_BANDS
+from ftw_dataset_tools.api.imagery.sources import DEFAULT_SOURCE, Sentinel2Source, source_class
+from ftw_dataset_tools.api.imagery.sources.sentinel2 import _missing_bands_error  # noqa: F401
 from ftw_dataset_tools.api.imagery.thumbnails import (
     PREVIEW_MEDIA_TYPE,
     PREVIEW_SUFFIX,
@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from affine import Affine
 
     from ftw_dataset_tools.api.imagery.scene_selection import SelectedScene
+    from ftw_dataset_tools.api.imagery.sources import ImagerySource
 
 __all__ = [
     "DownloadResult",
@@ -48,7 +49,9 @@ __all__ = [
 ]
 
 
-def stack_nodata(found_bands: list[str]) -> int | None:
+def stack_nodata(
+    found_bands: list[str], reflectance_bands: frozenset[str] = REFLECTANCE_BANDS
+) -> int | None:
     """Return 0 as the stack's nodata value, or None when 0 is a real measurement.
 
     Sentinel-2 L2A uses 0 as the reflectance fill value, and declaring it keeps
@@ -60,7 +63,7 @@ def stack_nodata(found_bands: list[str]) -> int | None:
     """
     if not found_bands:
         return None
-    if all(band.lower() in REFLECTANCE_BANDS for band in found_bands):
+    if all(band.lower() in reflectance_bands for band in found_bands):
         return 0
     return None
 
@@ -78,52 +81,20 @@ class DownloadResult:
     crs: str
     success: bool = True
     error: str | None = None
+    # The source is still preparing the scene (e.g. a Planet order); rerun to resume.
+    pending: bool = False
 
 
-def _get_band_hrefs(
-    item: pystac.Item,
-    bands: list[str],
-) -> dict[str, str]:
-    """
-    Get hrefs for specified bands from a STAC item.
-
-    Args:
-        item: STAC item
-        bands: List of band names to get
-
-    Returns:
-        Dict mapping band name to href
-    """
-    hrefs = {}
-    for band in bands:
-        asset = item.assets.get(band)
-        if asset:
-            hrefs[band] = asset.href
-    return hrefs
-
-
-def _missing_bands_error(item: pystac.Item, bands: list[str]) -> str:
-    """Explain why an item carries no asset for any of the requested `bands`.
-
-    A completed download replaces the child's band assets with a single local
-    `image` (or adds `clipped` under --keep-remote-refs), so one cause of an empty
-    band set is that this scene is already on disk - a symptom worth naming, since
-    "no matching band assets" reads like a broken catalog.
-
-    That only holds for bands a child item ever carries. A request for, say,
-    swir16 fails on an untouched catalog too, so blaming the local asset there
-    would be a false diagnosis - and would hide the list of what is available.
-    """
-    local_asset = next((key for key in ("image", "clipped") if key in item.assets), None)
-    never_carried = [band for band in bands if band not in CHILD_ITEM_BAND_ASSETS]
-    if local_asset is not None and not never_carried:
-        return (
-            "Scene is already downloaded: its band assets were replaced by the local "
-            f"'{local_asset}' asset, leaving nothing to fetch. Resume (the default) skips "
-            "these; to re-download, run select-images --force first to restore the remote "
-            "band refs (plain select-images skips chips that already have a selection)."
-        )
-    return f"No matching band assets found in scene. Available: {list(item.assets.keys())}"
+def provenance_tags(item: pystac.Item) -> dict[str, str]:
+    """GDAL metadata tags recording which scene a clipped image came from."""
+    properties = item.properties if isinstance(item.properties, dict) else {}
+    values = {
+        "FTW_SOURCE": properties.get("ftw:source"),
+        "FTW_SCENE_ID": properties.get("ftw:scene_id"),
+        "FTW_DATETIME": properties.get("datetime"),
+        "FTW_CHIP_CLOUD_COVER": properties.get("eo:cloud_cover"),
+    }
+    return {key: str(value) for key, value in values.items() if value is not None}
 
 
 def find_reference_mask_for_output(output_path: Path) -> Path | None:
@@ -137,14 +108,10 @@ def find_reference_mask_for_output(output_path: Path) -> Path | None:
     Returns:
         Path to reference mask if available, otherwise ``None``.
     """
-    stem = output_path.stem
-
-    if stem.endswith("_planting_image_s2"):
-        base_id = stem.removesuffix("_planting_image_s2")
-    elif stem.endswith("_harvest_image_s2"):
-        base_id = stem.removesuffix("_harvest_image_s2")
-    else:
+    parsed = parse_image_stem(output_path.stem)
+    if parsed is None:
         return None
+    base_id = parsed.chip_id
 
     candidates = [
         output_path.parent / f"{base_id}_semantic_3_class.tif",
@@ -245,6 +212,7 @@ def read_single_band(
     target_transform: Affine,
     target_width: int,
     target_height: int,
+    band_index: int = 1,
 ) -> tuple[str, np.ndarray]:
     """Read one band reprojected to the target grid."""
     resampling = (
@@ -262,7 +230,7 @@ def read_single_band(
             resampling=resampling,
         ) as warped_dataset,
     ):
-        data = warped_dataset.read(1)
+        data = warped_dataset.read(band_index)
 
     return band_name, data
 
@@ -273,6 +241,7 @@ def write_cog(
     found_bands: list[str],
     profile: dict,
     nodata: float | int | None = None,
+    tags: dict[str, str] | None = None,
 ) -> str | None:
     """Write stacked imagery as a COG with band descriptions and embedded statistics.
 
@@ -287,6 +256,8 @@ def write_cog(
     try:
         with rasterio.open(output_path, "w", **profile) as destination_dataset:
             destination_dataset.write(stacked)
+            if tags:
+                destination_dataset.update_tags(**tags)
             for band_index, band_name in enumerate(found_bands, start=1):
                 destination_dataset.set_band_description(band_index, band_name)
                 stats = compute_band_stats(stacked[band_index - 1], nodata=nodata)
@@ -330,6 +301,8 @@ def download_and_clip_scene(
     resolution: float = 10.0,
     reference_raster: Path | None = None,
     on_progress: Callable[[str], None] | None = None,
+    source: ImagerySource | None = None,
+    child_path: Path | None = None,
 ) -> DownloadResult:
     """
     Download and clip a scene to the specified bounding box.
@@ -344,22 +317,21 @@ def download_and_clip_scene(
             reference (CRS, transform, width, height). If not provided, the
             function auto-detects a co-located mask from ``output_path``.
         on_progress: Optional callback for progress messages
+        source: Source that locates the band pixels (default Sentinel-2)
+        child_path: The child item's JSON path, for sources that record state on it
 
     Returns:
         DownloadResult with output information
     """
     if bands is None:
         bands = BANDS_OF_INTEREST.copy()
+    source = source or Sentinel2Source()
 
     def log(msg: str) -> None:
         if on_progress:
             on_progress(msg)
 
-    log(f"Downloading {scene.id} bands: {bands}")
-
-    # Get band hrefs
-    band_hrefs = _get_band_hrefs(scene.item, bands)
-    if not band_hrefs:
+    def failure(error: str | None, *, pending: bool = False) -> DownloadResult:
         return DownloadResult(
             output_path=output_path,
             scene_id=scene.id,
@@ -369,7 +341,48 @@ def download_and_clip_scene(
             height=0,
             crs="",
             success=False,
-            error=_missing_bands_error(scene.item, bands),
+            error=error,
+            pending=pending,
+        )
+
+    log(f"Downloading {scene.id} bands: {bands}")
+
+    fetched = source.fetch(scene.item, child_path, bands, log)
+    if fetched.status != "ready":
+        return failure(fetched.error, pending=fetched.status == "pending")
+    try:
+        return _clip_to_grid(
+            scene, fetched.bands, bbox, output_path, resolution, reference_raster, source, log
+        )
+    finally:
+        for path in fetched.cleanup:
+            shutil.rmtree(path, ignore_errors=True)
+
+
+def _clip_to_grid(
+    scene: SelectedScene,
+    band_hrefs: dict[str, tuple[str, int]],
+    bbox: tuple[float, float, float, float],
+    output_path: Path,
+    resolution: float,
+    reference_raster: Path | None,
+    source: ImagerySource,
+    log: Callable[[str], None],
+) -> DownloadResult:
+    """Warp the located bands onto the chip's grid and write them as one COG."""
+    bands = list(band_hrefs)
+
+    def failure(error: str | None) -> DownloadResult:
+        return DownloadResult(
+            output_path=output_path,
+            scene_id=scene.id,
+            season=scene.season,
+            bands=bands,
+            width=0,
+            height=0,
+            crs="",
+            success=False,
+            error=error,
         )
 
     found_bands = list(band_hrefs.keys())
@@ -380,21 +393,11 @@ def download_and_clip_scene(
         output_path=output_path,
         resolution=resolution,
         reference_raster=reference_raster,
-        on_progress=on_progress,
+        on_progress=log,
     )
 
     if target_grid_error is not None or target_grid is None:
-        return DownloadResult(
-            output_path=output_path,
-            scene_id=scene.id,
-            season=scene.season,
-            bands=bands,
-            width=0,
-            height=0,
-            crs="",
-            success=False,
-            error=target_grid_error,
-        )
+        return failure(target_grid_error)
 
     target_crs, target_transform, target_width, target_height, reference_grid = target_grid
 
@@ -416,8 +419,9 @@ def download_and_clip_scene(
                 target_transform,
                 target_width,
                 target_height,
+                band_index,
             ): band_name
-            for band_name, href in band_hrefs.items()
+            for band_name, (href, band_index) in band_hrefs.items()
         }
 
         for future in as_completed(futures):
@@ -434,17 +438,7 @@ def download_and_clip_scene(
                 break
 
     if failed_band is not None:
-        return DownloadResult(
-            output_path=output_path,
-            scene_id=scene.id,
-            season=scene.season,
-            bands=bands,
-            width=0,
-            height=0,
-            crs="",
-            success=False,
-            error=f"Failed to read band {failed_band}: {failed_error}",
-        )
+        return failure(f"Failed to read band {failed_band}: {failed_error}")
 
     # Stack bands in the original order
     band_data = [band_results[band_name] for band_name in found_bands]
@@ -463,42 +457,27 @@ def download_and_clip_scene(
         "transform": target_transform,
         "compress": "deflate",
         # Only set when every band in the stack treats 0 as fill; see stack_nodata.
-        "nodata": stack_nodata(found_bands),
+        "nodata": stack_nodata(found_bands, source.reflectance_bands),
     }
 
     log(f"Writing to {output_path}...")
 
     write_error = write_cog(
-        output_path, stacked, found_bands, profile, nodata=profile.get("nodata")
+        output_path,
+        stacked,
+        found_bands,
+        profile,
+        nodata=profile.get("nodata"),
+        tags=provenance_tags(scene.item),
     )
     if write_error is not None:
-        return DownloadResult(
-            output_path=output_path,
-            scene_id=scene.id,
-            season=scene.season,
-            bands=bands,
-            width=0,
-            height=0,
-            crs="",
-            success=False,
-            error=write_error,
-        )
+        return failure(write_error)
 
     log(f"Successfully wrote {output_path}")
 
     alignment_error = validate_alignment(output_path, reference_grid)
     if alignment_error is not None:
-        return DownloadResult(
-            output_path=output_path,
-            scene_id=scene.id,
-            season=scene.season,
-            bands=bands,
-            width=0,
-            height=0,
-            crs="",
-            success=False,
-            error=alignment_error,
-        )
+        return failure(alignment_error)
 
     return DownloadResult(
         output_path=output_path,
@@ -597,12 +576,15 @@ def process_downloaded_scene(
     parent_item_path = item_path.parent / f"{base_id}.json"
     if parent_item_path.exists():
         parent_item = pystac.Item.from_file(str(parent_item_path))
+        source = item.properties.get("ftw:source", DEFAULT_SOURCE)
+        # Another source only supplies the chip preview when the default has none.
+        owns_preview = source == DEFAULT_SOURCE or "thumbnail" not in parent_item.assets
 
         # Generate overlay thumbnail for planting season if mask exists
         thumb_for_parent = None
         is_overlay = False
 
-        if result.thumbnail_path and season == "planting":
+        if result.thumbnail_path and season == "planting" and owns_preview:
             # Look for semantic 3-class mask
             mask_path = item_path.parent / f"{base_id}_semantic_3_class.tif"
             if mask_path.exists():
@@ -632,6 +614,8 @@ def process_downloaded_scene(
             band_list=band_list,
             thumbnail_filename=thumb_for_parent,
             is_overlay=is_overlay,
+            asset_key=parent_asset_key(season, "image", source),
+            source_title=None if source == DEFAULT_SOURCE else source_class(source).title,
         )
 
     return result

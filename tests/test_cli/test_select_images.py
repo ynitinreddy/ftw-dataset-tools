@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import pystac
+import pytest
 from click.testing import CliRunner
 
 from ftw_dataset_tools.cli import cli
@@ -275,6 +276,50 @@ class TestSelectImagesCropCalendarWarmup:
 
         assert result.exit_code == 0, result.output
         assert events == ["warm", "chip"]
+
+    @pytest.mark.usefixtures("crop_calendar_warmup")
+    def test_source_options_reach_selection(self, tmp_path: Path, monkeypatch) -> None:
+        from ftw_dataset_tools.api.imagery import selection_workflow
+        from ftw_dataset_tools.api.imagery.crop_calendar import CropCalendarDates
+        from ftw_dataset_tools.api.imagery.scene_selection import SceneSelectionResult
+
+        dataset_dir = tmp_path / "dataset"
+        dataset_dir.mkdir()
+        _write_minimal_collection(dataset_dir / "collection.json")
+        _write_chip_item(dataset_dir / "chips" / "33UXP" / "ftw-item1", "ftw-item1")
+        seen: dict = {}
+
+        def _fake_select(*, chip_id: str, bbox, year: int, **kwargs) -> SceneSelectionResult:
+            seen.update(kwargs)
+            return SceneSelectionResult(
+                chip_id=chip_id,
+                bbox=bbox,
+                year=year,
+                crop_calendar=CropCalendarDates(planting_day=1, harvest_day=180),
+                skipped_reason="No cloud-free scenes",
+            )
+
+        monkeypatch.setattr(selection_workflow, "select_scenes_for_chip", _fake_select)
+
+        result = CliRunner().invoke(
+            cli,
+            [
+                "select-images",
+                str(dataset_dir),
+                "--year",
+                "2024",
+                "--source",
+                "planetscope",
+                "--planet-bundle",
+                "analytic_8b_sr_udm2",
+                "--record-candidates",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert seen["source"].name == "planetscope"
+        assert seen["source"].bundle == "analytic_8b_sr_udm2"
+        assert seen["record_candidates"] is True
 
     def test_no_warmup_when_nothing_to_process(self, tmp_path: Path, crop_calendar_warmup) -> None:
         """A catalog whose only chip is skipped up front never touches the network."""

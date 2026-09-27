@@ -240,6 +240,15 @@ class TestCreateDatasetImageSelection:
 
         assert result.exit_code == 0, result.output
         assert stub_pipeline.calls[0]["search_backend"] == "earth-search"
+        assert stub_pipeline.calls[0]["source"].backend == "earth-search"
+
+    def test_image_source_option_reaches_workflow(
+        self, stub_pipeline: SelectionStub, sample_fields_geoparquet: Path
+    ) -> None:
+        result = _invoke(sample_fields_geoparquet, "--image-source", "planetscope")
+
+        assert result.exit_code == 0, result.output
+        assert stub_pipeline.calls[0]["source"].name == "planetscope"
 
     def test_passes_through_selection_options(
         self, stub_pipeline: SelectionStub, sample_fields_geoparquet: Path

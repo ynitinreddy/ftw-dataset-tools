@@ -652,7 +652,7 @@ class TestSearchBackendThreading:
             catalog_dir=catalog, year=2024, workers=1, search_backend="earth-search"
         )
 
-        assert seen["search_backend"] == "earth-search"
+        assert seen["source"].backend == "earth-search"
 
 
 def _write_chip_catalog(tmp_path: Path, chip_ids: list[str]) -> Path:

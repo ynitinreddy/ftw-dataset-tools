@@ -8,13 +8,14 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from ftw_dataset_tools.api.imagery import scene_selection
+from ftw_dataset_tools.api.imagery.sources import sentinel2
 
 
 @pytest.fixture(autouse=True)
 def _clear_thread_client_cache() -> None:
     """Drop this thread's cached clients so each test starts cold."""
-    if hasattr(scene_selection._CLIENTS, "by_url"):
-        del scene_selection._CLIENTS.by_url
+    if hasattr(sentinel2._CLIENTS, "by_url"):
+        del sentinel2._CLIENTS.by_url
 
 
 class TestGetStacClient:
@@ -22,20 +23,20 @@ class TestGetStacClient:
 
     def test_same_thread_reuses_one_client(self) -> None:
         with patch.object(
-            scene_selection.pystac_client.Client, "open", side_effect=lambda url: MagicMock(url=url)
+            sentinel2.pystac_client.Client, "open", side_effect=lambda url: MagicMock(url=url)
         ) as opened:
-            first = scene_selection._get_stac_client("https://example.test/stac")
-            second = scene_selection._get_stac_client("https://example.test/stac")
+            first = sentinel2._get_stac_client("https://example.test/stac")
+            second = sentinel2._get_stac_client("https://example.test/stac")
 
         assert first is second
         assert opened.call_count == 1
 
     def test_different_urls_get_different_clients(self) -> None:
         with patch.object(
-            scene_selection.pystac_client.Client, "open", side_effect=lambda url: MagicMock(url=url)
+            sentinel2.pystac_client.Client, "open", side_effect=lambda url: MagicMock(url=url)
         ):
-            first = scene_selection._get_stac_client("https://example.test/a")
-            second = scene_selection._get_stac_client("https://example.test/b")
+            first = sentinel2._get_stac_client("https://example.test/a")
+            second = sentinel2._get_stac_client("https://example.test/b")
 
         assert first is not second
 
@@ -49,12 +50,12 @@ class TestGetStacClient:
         clients_lock = threading.Lock()
 
         def grab() -> None:
-            client = scene_selection._get_stac_client("https://example.test/stac")
+            client = sentinel2._get_stac_client("https://example.test/stac")
             with clients_lock:
                 clients.append(client)
 
         with patch.object(
-            scene_selection.pystac_client.Client, "open", side_effect=lambda url: MagicMock(url=url)
+            sentinel2.pystac_client.Client, "open", side_effect=lambda url: MagicMock(url=url)
         ):
             threads = [threading.Thread(target=grab) for _ in range(4)]
             for thread in threads:
@@ -110,7 +111,7 @@ class TestSearchBackendDispatch:
             calls.append((bbox, start, end, cloud_cover_max))
             return [_canned_item("S2A_33TVM_fake", datetime(2021, 5, 30, 10, 0, tzinfo=UTC))]
 
-        monkeypatch.setattr(scene_selection.parquet_search, "query_scenes", fake_query_scenes)
+        monkeypatch.setattr(sentinel2.parquet_search, "query_scenes", fake_query_scenes)
         result = scene_selection.select_scenes_for_chip(
             chip_id="chip_001",
             bbox=self.BBOX,
@@ -128,7 +129,7 @@ class TestSearchBackendDispatch:
 
         def fake_query_stac(**kwargs):
             calls.append(kwargs)
-            return scene_selection.STACQueryResult(
+            return sentinel2.STACQueryResult(
                 items=[_canned_item("S2A_33TVM_fake", datetime(2021, 5, 30, 10, 0, tzinfo=UTC))],
                 catalog_url="https://earth-search.aws.element84.com/v1",
                 collection="sentinel-2-c1-l2a",
@@ -137,7 +138,7 @@ class TestSearchBackendDispatch:
                 cloud_cover_max=75,
             )
 
-        monkeypatch.setattr(scene_selection, "_query_stac", fake_query_stac)
+        monkeypatch.setattr(sentinel2, "_query_stac", fake_query_stac)
         result = scene_selection.select_scenes_for_chip(
             chip_id="chip_001",
             bbox=self.BBOX,
@@ -170,7 +171,7 @@ class TestSearchBackendDispatch:
             seen.update(kwargs)
             return [_canned_item("S2A_T33TVM_fake", datetime(2021, 5, 30, 10, 0, tzinfo=UTC))]
 
-        monkeypatch.setattr(scene_selection.parquet_search, "query_scenes", fake_query_scenes)
+        monkeypatch.setattr(sentinel2.parquet_search, "query_scenes", fake_query_scenes)
         scene_selection.select_scenes_for_chip(
             chip_id="chip_001",
             bbox=self.BBOX,
@@ -204,7 +205,7 @@ class TestSelectBestSceneNodata:
     def test_zero_scene_nodata_accepts_without_pixel_check(self, monkeypatch):
         called = []
         monkeypatch.setattr(
-            scene_selection,
+            sentinel2,
             "calculate_nodata_percentage",
             lambda href, _bbox: called.append(href) or 0.0,
         )
@@ -216,18 +217,14 @@ class TestSelectBestSceneNodata:
 
     def test_scene_nodata_triggers_chip_pixel_check_and_accepts_clean_window(self, monkeypatch):
         """A scene with edge nodata is kept when the chip's own window has none."""
-        monkeypatch.setattr(
-            scene_selection, "calculate_nodata_percentage", lambda _href, _bbox: 0.0
-        )
+        monkeypatch.setattr(sentinel2, "calculate_nodata_percentage", lambda _href, _bbox: 0.0)
         scene = scene_selection._select_best_scene(
             [self._item(18.3)], season="planting", bbox=self.BBOX
         )
         assert scene is not None
 
     def test_chip_window_nodata_still_rejects(self, monkeypatch):
-        monkeypatch.setattr(
-            scene_selection, "calculate_nodata_percentage", lambda _href, _bbox: 42.0
-        )
+        monkeypatch.setattr(sentinel2, "calculate_nodata_percentage", lambda _href, _bbox: 42.0)
         scene = scene_selection._select_best_scene(
             [self._item(18.3)], season="planting", bbox=self.BBOX
         )
@@ -239,7 +236,7 @@ class TestSelectBestSceneNodata:
 
     def test_failed_pixel_check_falls_back_to_scene_nodata(self, monkeypatch):
         """A scene whose metadata reports nodata is rejected when the pixel check fails."""
-        monkeypatch.setattr(scene_selection, "calculate_nodata_percentage", self._failing_check)
+        monkeypatch.setattr(sentinel2, "calculate_nodata_percentage", self._failing_check)
         scene = scene_selection._select_best_scene(
             [self._item(18.3)], season="planting", bbox=self.BBOX
         )
@@ -247,7 +244,7 @@ class TestSelectBestSceneNodata:
 
     def test_failed_pixel_check_without_scene_nodata_continues(self, monkeypatch):
         """With no scene-level value to fall back on, a failed check does not reject."""
-        monkeypatch.setattr(scene_selection, "calculate_nodata_percentage", self._failing_check)
+        monkeypatch.setattr(sentinel2, "calculate_nodata_percentage", self._failing_check)
         scene = scene_selection._select_best_scene(
             [self._item(None)], season="planting", bbox=self.BBOX
         )

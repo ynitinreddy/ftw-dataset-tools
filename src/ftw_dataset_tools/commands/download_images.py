@@ -12,13 +12,14 @@ from tqdm import tqdm
 
 from ftw_dataset_tools.api.imagery import (
     find_collection_dir,
-    find_s2_child_items,
     process_downloaded_scene,
 )
 from ftw_dataset_tools.api.imagery.download_workflow import (
     DownloadTask,
+    SourceCache,
     build_download_task,
     download_task_scene,
+    find_child_items,
     skip_download_reason,
 )
 from ftw_dataset_tools.api.imagery.parallel import (
@@ -27,6 +28,7 @@ from ftw_dataset_tools.api.imagery.parallel import (
     ParallelOutcome,
     run_in_parallel,
 )
+from ftw_dataset_tools.api.imagery.sources import SOURCE_NAMES, SourceUnavailableError
 from ftw_dataset_tools.api.imagery.thumbnails import has_rgb_bands
 from ftw_dataset_tools.api.stac_items import STACSaveError, write_item
 
@@ -60,6 +62,10 @@ VALID_BANDS: tuple[str, ...] = (
     "snow",  # Snow probability
     # Composite
     "visual",  # True color RGB composite
+    # PlanetScope 8-band only
+    "green_i",
+    "yellow",
+    "rededge",
 )
 
 
@@ -67,6 +73,7 @@ def _record_download(
     outcome: ParallelOutcome[DownloadTask, DownloadResult],
     *,
     successful: list[str],
+    skipped: list[dict],
     failed: list[dict],
     band_list: list[str],
     keep_remote_refs: bool,
@@ -82,11 +89,16 @@ def _record_download(
         if message.startswith("Grid:"):
             tqdm.write(f"  {message}")
 
+    if isinstance(outcome.error, SourceUnavailableError):
+        raise click.ClickException(str(outcome.error)) from outcome.error
     if outcome.error is not None:
         failed.append({"item": task.item.id, "error": str(outcome.error)})
         return
 
     result = outcome.value
+    if result is not None and result.pending is True:
+        skipped.append({"item": task.item.id, "reason": result.error})
+        return
     if result is None or not result.success:
         failed.append({"item": task.item.id, "error": result.error if result else "Unknown error"})
         return
@@ -148,12 +160,38 @@ def _update_stac_items(
 @click.command("download-images")
 @click.argument("catalog_path", type=click.Path(exists=True))
 @click.option(
+    "--source",
+    type=click.Choice(SOURCE_NAMES),
+    default=None,
+    help="Only download this source's selections (default: every source).",
+)
+@click.option(
     "--bands",
     type=click.Choice(VALID_BANDS, case_sensitive=False),
     multiple=True,
     default=("red", "green", "blue", "nir"),
     show_default=True,
-    help="Sentinel-2 bands to download. Can be specified multiple times.",
+    help="Bands to download. Can be specified multiple times.",
+)
+@click.option(
+    "--planet-harmonize/--no-planet-harmonize",
+    default=True,
+    show_default=True,
+    help="Harmonize PlanetScope orders to Sentinel-2.",
+)
+@click.option(
+    "--planet-wait/--no-planet-wait",
+    default=True,
+    show_default=True,
+    help="Wait for PlanetScope orders. With --no-planet-wait orders are submitted "
+    "and a later run downloads them.",
+)
+@click.option(
+    "--planet-timeout",
+    type=click.FloatRange(min=0),
+    default=60.0,
+    show_default=True,
+    help="Minutes to wait for each PlanetScope order before leaving it for a later run.",
 )
 @click.option(
     "--resolution",
@@ -203,7 +241,11 @@ def _update_stac_items(
 )
 def download_images_cmd(
     catalog_path: str,
+    source: str | None,
     bands: tuple[str, ...],
+    planet_harmonize: bool,
+    planet_wait: bool,
+    planet_timeout: float,
     resolution: float,
     resume: bool,
     output_report: str | None,
@@ -225,6 +267,9 @@ def download_images_cmd(
 
     Chips that already have local imagery are left alone, so a second run picks up
     where the first stopped. Pass --no-resume to fetch every chip again.
+
+    PlanetScope scenes are ordered clipped to the chip; an order still running
+    is reported as skipped and picked up by the next run.
 
     \b
     CATALOG_PATH: Path to the dataset directory (containing collection.json)
@@ -248,17 +293,17 @@ def download_images_cmd(
     click.echo(f"Bands: {band_list}")
     click.echo(f"Resolution: {resolution}m")
 
-    # Find all child S2 items (planting and harvest). Items whose JSON cannot be
-    # read are reported as failures rather than silently dropped from the run.
+    # Items whose JSON cannot be read are reported as failures rather than
+    # silently dropped from the run.
     unreadable: list[dict] = []
-    child_items = find_s2_child_items(catalog_dir, unreadable=unreadable)
+    child_items = find_child_items(catalog_dir, unreadable=unreadable, source=source)
 
     if not child_items and not unreadable:
         raise click.ClickException(
-            "No S2 child items found. Run 'select-images' first to create them."
+            "No season child items found. Run 'select-images' first to create them."
         )
 
-    click.echo(f"\nFound {len(child_items)} S2 items to download")
+    click.echo(f"\nFound {len(child_items)} items to download")
 
     # Track results
     successful: list[str] = []
@@ -277,17 +322,26 @@ def download_images_cmd(
         tasks.append(build_download_task(item, item_path))
 
     generate_thumbnails = preview and has_rgb_bands(band_list)
+    sources = SourceCache(
+        planet_harmonize=planet_harmonize,
+        planet_wait=planet_wait,
+        planet_timeout_minutes=planet_timeout,
+    )
+    resolved = {task.source: sources.get(task.source) for task in tasks}
 
     with tqdm(total=len(child_items), desc="Downloading imagery", unit="scene") as pbar:
         pbar.update(len(skipped))
 
         def work(task: DownloadTask) -> DownloadResult:
-            return download_task_scene(task, bands=band_list, resolution=resolution)
+            return download_task_scene(
+                task, bands=band_list, resolution=resolution, source=resolved[task.source]
+            )
 
         def apply(outcome: ParallelOutcome[DownloadTask, DownloadResult]) -> None:
             _record_download(
                 outcome,
                 successful=successful,
+                skipped=skipped,
                 failed=failed,
                 band_list=band_list,
                 keep_remote_refs=keep_remote_refs,

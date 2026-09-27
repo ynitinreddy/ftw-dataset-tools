@@ -12,6 +12,13 @@ from pathlib import Path
 
 import pystac
 
+from ftw_dataset_tools.api.imagery.naming import (
+    SEASONS,
+    child_item_id,
+    imagery_asset_keys,
+    link_source,
+)
+from ftw_dataset_tools.api.imagery.sources import DEFAULT_SOURCE, SOURCES, source_class
 from ftw_dataset_tools.api.imagery.thumbnails import PREVIEW_EXTENSIONS
 from ftw_dataset_tools.api.stac_items import write_item
 
@@ -55,12 +62,14 @@ IMAGERY_PROPERTIES = (
     "ftw:harvest_cloud_cover",
 )
 
+_SHARED_PROPERTIES = ("ftw:calendar_year", "ftw:planting_day", "ftw:harvest_day")
+
 # Selection narrows these to the actual scene acquisition dates; a freshly
 # generated item carries the dataset-wide extent instead.
 IMAGERY_TEMPORAL_PROPERTIES = ("start_datetime", "end_datetime")
 
-# Added to the parent once imagery has been downloaded.
-IMAGERY_ASSET_KEYS = ("planting_image", "harvest_image", "thumbnail")
+# Added to the parent once imagery has been downloaded (default source).
+IMAGERY_ASSET_KEYS = imagery_asset_keys(DEFAULT_SOURCE)
 
 
 def iter_chip_dirs(collection_dir: Path) -> list[Path]:
@@ -90,18 +99,20 @@ def find_collection_dir(path: Path) -> Path:
     raise FileNotFoundError(f"No collection.json in {path}; pass the dataset output directory")
 
 
-def has_existing_scenes(item: pystac.Item) -> bool:
-    """Check if item already has planting and harvest scene links.
+def has_existing_scenes(item: pystac.Item, source: str | None = None) -> bool:
+    """Whether the item links both a planting and a harvest scene.
 
-    Args:
-        item: STAC item to check
-
-    Returns:
-        True if item has both ftw:planting and ftw:harvest links
+    With ``source`` only that source's links count; otherwise any one source
+    having both seasons does.
     """
-    has_planting = any(link.rel == "ftw:planting" for link in item.links)
-    has_harvest = any(link.rel == "ftw:harvest" for link in item.links)
-    return has_planting and has_harvest
+    sources = SOURCES if source is None else (source,)
+    return any(
+        all(
+            any(link.rel == f"ftw:{season}" and link_source(link) == name for link in item.links)
+            for season in SEASONS
+        )
+        for name in sources
+    )
 
 
 def preserve_imagery_selection(item: pystac.Item, existing_item_path: Path) -> bool:
@@ -150,9 +161,9 @@ def preserve_imagery_selection(item: pystac.Item, existing_item_path: Path) -> b
     # whose children were deleted re-selects instead of keeping a dangling link
     # that would make it look selected forever.
     chip_dir = existing_item_path.parent
-    rebuilt_rels = {link.rel for link in item.links}
+    rebuilt = {(link.rel, link_source(link)) for link in item.links}
     for link in existing.links:
-        if link.rel not in IMAGERY_LINK_RELS or link.rel in rebuilt_rels:
+        if link.rel not in IMAGERY_LINK_RELS or (link.rel, link_source(link)) in rebuilt:
             continue
         if (chip_dir / Path(link.href).name).exists():
             item.add_link(link.clone())
@@ -163,7 +174,7 @@ def preserve_imagery_selection(item: pystac.Item, existing_item_path: Path) -> b
 
     # Downloaded imagery outlives the catalog, but only advertise assets whose
     # files are still on disk.
-    for key in IMAGERY_ASSET_KEYS:
+    for key in imagery_asset_keys():
         if key in item.assets:
             continue
         asset = existing.assets.get(key)
@@ -208,29 +219,27 @@ class ImageryStats:
         return sum(self.harvest_cloud_covers) / len(self.harvest_cloud_covers)
 
 
-def get_imagery_stats(chip_items: list[pystac.Item]) -> ImageryStats:
+def get_imagery_stats(chip_items: list[pystac.Item], source: str | None = None) -> ImageryStats:
     """Gather imagery selection statistics from chip items.
 
-    Args:
-        chip_items: List of STAC items to analyze
-
-    Returns:
-        ImageryStats with counts and cloud cover data
+    Cloud cover comes from the parent's default-source properties, so it is only
+    gathered for the default source.
     """
     stats = ImageryStats(total=len(chip_items))
 
     for item in chip_items:
-        if has_existing_scenes(item):
-            stats.with_imagery += 1
-            # Get cloud cover values
-            planting_cc = item.properties.get("ftw:planting_cloud_cover")
-            harvest_cc = item.properties.get("ftw:harvest_cloud_cover")
-            if planting_cc is not None:
-                stats.planting_cloud_covers.append(planting_cc)
-            if harvest_cc is not None:
-                stats.harvest_cloud_covers.append(harvest_cc)
-        else:
+        if not has_existing_scenes(item, source):
             stats.without_imagery += 1
+            continue
+        stats.with_imagery += 1
+        if source not in (None, DEFAULT_SOURCE):
+            continue
+        planting_cc = item.properties.get("ftw:planting_cloud_cover")
+        harvest_cc = item.properties.get("ftw:harvest_cloud_cover")
+        if planting_cc is not None:
+            stats.planting_cloud_covers.append(planting_cc)
+        if harvest_cc is not None:
+            stats.harvest_cloud_covers.append(harvest_cc)
 
     return stats
 
@@ -264,63 +273,76 @@ def chip_dir_for_item(item: pystac.Item) -> Path:
     return Path(self_href).parent
 
 
-def clear_chip_selections(item: pystac.Item) -> ClearResult:
-    """Clear imagery selections for a single chip.
+def _delete_source_files(item_id: str, chip_dir: Path, source: str, result: ClearResult) -> None:
+    suffix = source_class(source).suffix
+    for season in SEASONS:
+        child_json = chip_dir / f"{child_item_id(item_id, season, source)}.json"
+        if child_json.exists():
+            child_json.unlink()
+            result.stac_items_deleted += 1
 
-    Removes child STAC items, GeoTIFF files, and imagery-related properties
-    from the parent item. Restores the item's datetime to a valid state.
+        for tif in chip_dir.glob(f"{item_id}_{season}_*_{suffix}.tif"):
+            tif.unlink()
+            result.geotiffs_deleted += 1
 
-    Args:
-        item: Parent chip STAC item (will be modified and saved). Must carry a
-            self href, which locates the chip directory whose files are deleted.
+        # Both extensions: previews are written as WebP, but a catalog built before
+        # that switch still has .jpg here.
+        for ext in PREVIEW_EXTENSIONS:
+            for thumb in chip_dir.glob(f"{item_id}_{season}_*_{suffix}{ext}"):
+                thumb.unlink()
 
-    Returns:
-        ClearResult with counts of deleted items
+
+def clear_chip_selections(item: pystac.Item, source: str | None = None) -> ClearResult:
+    """Clear one source's imagery selections for a chip, or every source's.
+
+    Removes child STAC items, GeoTIFF files, and imagery-related links, assets and
+    properties from the parent item, which is saved. Clearing the default source
+    also restores the item's datetime to a valid state.
 
     Raises:
         ValueError: If the item has no self href.
     """
     chip_dir = chip_dir_for_item(item)
     result = ClearResult()
+    sources = list(SOURCES) if source is None else [source]
 
-    # Delete planting and harvest child STAC items and their GeoTIFFs
-    for season in ["planting", "harvest"]:
-        child_json = chip_dir / f"{item.id}_{season}_s2.json"
-        if child_json.exists():
-            child_json.unlink()
-            result.stac_items_deleted += 1
+    for name in sources:
+        _delete_source_files(item.id, chip_dir, name, result)
+    item.links = [
+        link
+        for link in item.links
+        if link.rel not in IMAGERY_LINK_RELS or link_source(link) not in sources
+    ]
+    for name in sources:
+        for asset_key in imagery_asset_keys(name):
+            item.assets.pop(asset_key, None)
 
-        # Delete associated GeoTIFFs (e.g., ftw-xxx_planting_image_s2.tif)
-        for tif in chip_dir.glob(f"{item.id}_{season}_*.tif"):
-            tif.unlink()
-            result.geotiffs_deleted += 1
+    if DEFAULT_SOURCE in sources:
+        _clear_default_source(item, chip_dir)
 
-        # Delete thumbnails. Both extensions: previews are written as WebP, but a
-        # catalog built before that switch still has .jpg here, and leaving either
-        # behind strands a preview for imagery that no longer exists.
-        for ext in PREVIEW_EXTENSIONS:
-            for thumb in chip_dir.glob(f"{item.id}_{season}_*{ext}"):
-                thumb.unlink()
+    parent_path = chip_dir / f"{item.id}.json"
+    if item.get_self_href() is None:
+        item.set_self_href(str(parent_path))
+    write_item(item, parent_path)
 
-    # Delete overlay thumbnail if it exists
+    return result
+
+
+def _clear_default_source(item: pystac.Item, chip_dir: Path) -> None:
+    """Drop the overlay preview and parent properties only the default source writes."""
     for ext in PREVIEW_EXTENSIONS:
         overlay = chip_dir / f"{item.id}_overlay{ext}"
         if overlay.exists():
             overlay.unlink()
 
-    # Remove ftw:planting and ftw:harvest links from parent item
-    item.links = [link for link in item.links if link.rel not in IMAGERY_LINK_RELS]
-
     # Extract calendar year before removing properties (needed to restore datetime)
     calendar_year = item.properties.get("ftw:calendar_year")
 
-    # Remove ftw: properties related to imagery selection
+    # The crop calendar stays while another source's selection still uses it.
+    shared = _SHARED_PROPERTIES if has_existing_scenes(item) else ()
     for prop in IMAGERY_PROPERTIES:
-        item.properties.pop(prop, None)
-
-    # Remove planting_image, harvest_image, and thumbnail assets if they exist
-    for asset_key in IMAGERY_ASSET_KEYS:
-        item.assets.pop(asset_key, None)
+        if prop not in shared:
+            item.properties.pop(prop, None)
 
     # Restore datetime - STAC requires either datetime or both start/end_datetime
     # Remove the selection-set temporal range and restore a single datetime
@@ -335,11 +357,3 @@ def clear_chip_selections(item: pystac.Item) -> ClearResult:
     # Set both the Item attribute and the properties dict
     item.datetime = restored_dt
     item.properties["datetime"] = restored_dt.isoformat()
-
-    # Always save since we've modified the item (removed properties, restored datetime)
-    parent_path = chip_dir / f"{item.id}.json"
-    if item.get_self_href() is None:
-        item.set_self_href(str(parent_path))
-    write_item(item, parent_path)
-
-    return result

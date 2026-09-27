@@ -22,6 +22,7 @@ import pystac
 
 from ftw_dataset_tools.api.imagery.catalog_ops import has_existing_scenes, iter_chip_dirs
 from ftw_dataset_tools.api.imagery.crop_calendar import ensure_crop_calendar_exists
+from ftw_dataset_tools.api.imagery.naming import parse_child_id
 from ftw_dataset_tools.api.imagery.parallel import (
     DEFAULT_WORKERS,
     ParallelOutcome,
@@ -29,12 +30,14 @@ from ftw_dataset_tools.api.imagery.parallel import (
 )
 from ftw_dataset_tools.api.imagery.progress import ImageryProgressBar
 from ftw_dataset_tools.api.imagery.scene_selection import select_scenes_for_chip
+from ftw_dataset_tools.api.imagery.sources import Sentinel2Source
 from ftw_dataset_tools.api.imagery.stac_child_items import create_child_items_from_selection
 
 if TYPE_CHECKING:
     from pathlib import Path
 
     from ftw_dataset_tools.api.imagery.scene_selection import SceneSelectionResult
+    from ftw_dataset_tools.api.imagery.sources import ImagerySource
 
 __all__ = [
     "ChipSelectionJob",
@@ -69,6 +72,8 @@ def run_chip_selection(
     num_buffer_expansions: int,
     buffer_expansion_size: int,
     search_backend: str = "parquet",
+    source: ImagerySource | None = None,
+    record_candidates: bool = False,
 ) -> SceneSelectionResult:
     """Select scenes for one chip and write its child items.
 
@@ -86,6 +91,8 @@ def run_chip_selection(
         buffer_expansion_size=buffer_expansion_size,
         search_backend=search_backend,
         on_progress=job.logs.append,
+        source=source,
+        record_candidates=record_candidates,
     )
 
     if selection.success:
@@ -120,8 +127,8 @@ def find_chip_items(
 ) -> list[tuple[pystac.Item, Path]]:
     """Find all parent chip items in a catalog directory.
 
-    Searches subdirectories for STAC item JSON files, excluding child S2 items
-    (those ending in _planting_s2 or _harvest_s2).
+    Searches subdirectories for STAC item JSON files, excluding season child
+    items (``<chip>_<season>_<source>.json``).
 
     Args:
         catalog_dir: Path to the collection directory (holding collection.json),
@@ -140,8 +147,7 @@ def find_chip_items(
 
     for subdir in iter_chip_dirs(catalog_dir):
         for json_file in subdir.glob("*.json"):
-            # Skip child items (they have _planting_s2 or _harvest_s2 suffix)
-            if "_planting_s2" in json_file.name or "_harvest_s2" in json_file.name:
+            if parse_child_id(json_file.stem) is not None:
                 continue
             try:
                 item = pystac.Item.from_file(str(json_file))
@@ -167,6 +173,8 @@ def select_imagery_for_catalog(
     verbose: bool = False,
     workers: int = DEFAULT_WORKERS,
     search_backend: str = "parquet",
+    source: ImagerySource | None = None,
+    record_candidates: bool = False,
 ) -> SelectionWorkflowResult:
     """Select imagery for all chips in a catalog.
 
@@ -189,6 +197,9 @@ def select_imagery_for_catalog(
         workers: Number of chips to select for concurrently
         search_backend: "parquet" (the STAC-GeoParquet mirror, default) or
                         "earth-search" (the Earth Search STAC API)
+        source: Imagery source to select from; defaults to Sentinel-2 with
+                ``search_backend``. Only this source's selections are skipped/forced.
+        record_candidates: Also record every clear candidate scene per season
 
     Returns:
         SelectionWorkflowResult with success/skipped/failed counts and details
@@ -197,6 +208,7 @@ def select_imagery_for_catalog(
         Exception: If on_missing="fail" and no cloud-free scenes found
     """
     result = SelectionWorkflowResult()
+    source = source or Sentinel2Source(backend=search_backend)
 
     # Find all chip items; chips whose JSON cannot be read are reported as
     # failures rather than silently dropped from the run.
@@ -220,7 +232,7 @@ def select_imagery_for_catalog(
             continue
 
         # Skip chips that already have scene selections (unless --force)
-        if not force and has_existing_scenes(item):
+        if not force and has_existing_scenes(item, source.name):
             result.skipped += 1
             result.skipped_details.append(
                 {"chip": item.id, "reason": "Already has imagery selections"}
@@ -248,7 +260,8 @@ def select_imagery_for_catalog(
         on_missing=on_missing,
         verbose=verbose,
         workers=workers,
-        search_backend=search_backend,
+        source=source,
+        record_candidates=record_candidates,
     )
 
     return result
@@ -267,7 +280,8 @@ def _run_selection(
     on_missing: Literal["skip", "fail"],
     verbose: bool,
     workers: int,
-    search_backend: str = "parquet",
+    source: ImagerySource,
+    record_candidates: bool,
 ) -> None:
     """Select scenes for every chip on a thread pool, recording outcomes as they finish.
 
@@ -289,7 +303,8 @@ def _run_selection(
             buffer_days=buffer_days,
             num_buffer_expansions=num_buffer_expansions,
             buffer_expansion_size=buffer_expansion_size,
-            search_backend=search_backend,
+            source=source,
+            record_candidates=record_candidates,
         )
 
     with ImageryProgressBar(total=len(jobs), leave=False, verbose=verbose) as progress:

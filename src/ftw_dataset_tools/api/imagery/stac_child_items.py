@@ -13,8 +13,19 @@ from typing import TYPE_CHECKING, Literal
 import pystac
 
 from ftw_dataset_tools.api.assets import add_file_info, add_raster_bands
-from ftw_dataset_tools.api.imagery.catalog_ops import IMAGERY_ASSET_KEYS
-from ftw_dataset_tools.api.imagery.settings import CHILD_ITEM_BANDS
+from ftw_dataset_tools.api.imagery.naming import (
+    SEASONS,
+    child_item_id,
+    imagery_asset_keys,
+    link_source,
+    parent_asset_key,
+)
+from ftw_dataset_tools.api.imagery.sources import (
+    DEFAULT_SOURCE,
+    SOURCES,
+    Sentinel2Source,
+    source_class,
+)
 from ftw_dataset_tools.api.imagery.thumbnails import (
     LEGACY_PREVIEW_MEDIA_TYPE,
     PREVIEW_MEDIA_TYPE,
@@ -25,6 +36,7 @@ from ftw_dataset_tools.api.stac_items import write_item
 
 if TYPE_CHECKING:
     from ftw_dataset_tools.api.imagery.scene_selection import SceneSelectionResult, SelectedScene
+    from ftw_dataset_tools.api.imagery.sources import ImagerySource
 
 __all__ = [
     "attach_existing_seasons",
@@ -32,8 +44,6 @@ __all__ = [
     "attach_thumbnail_to_parent",
     "create_child_items_from_selection",
 ]
-
-SEASONS: tuple[Literal["planting", "harvest"], ...] = ("planting", "harvest")
 
 # Links that place an item in the catalog tree; children live next to their parent
 # chip item, so the parent's relative hrefs are valid for them verbatim.
@@ -78,60 +88,37 @@ def create_child_items_from_selection(
     if parent_item.get_self_href() is None:
         parent_item.set_self_href(str(parent_path))
 
-    # Update parent item with FTW properties
+    source: ImagerySource = result.source or Sentinel2Source()
+
+    # The crop calendar is shared by every source; the rest of the parent's
+    # selection bookkeeping describes the default source's scenes only.
     parent_item.properties["ftw:calendar_year"] = year
     parent_item.properties["ftw:planting_day"] = result.crop_calendar.planting_day
     parent_item.properties["ftw:harvest_day"] = result.crop_calendar.harvest_day
-    parent_item.properties["ftw:stac_host"] = (result.selection_params or {}).get(
-        "stac_host", "earthsearch"
-    )
-    parent_item.properties["ftw:cloud_cover_chip_threshold"] = cloud_cover_chip
-    parent_item.properties["ftw:buffer_days"] = buffer_days
-    parent_item.properties["ftw:num_buffer_expansions"] = num_buffer_expansions
-    parent_item.properties["ftw:buffer_expansion_size"] = buffer_expansion_size
-
-    # Track actual buffer used for each season
-    parent_item.properties["ftw:planting_buffer_used"] = result.planting_buffer_used
-    parent_item.properties["ftw:harvest_buffer_used"] = result.harvest_buffer_used
-    parent_item.properties["ftw:expansions_performed"] = result.expansions_performed
-
-    # Set temporal extent based on actual scene acquisition dates
-    # Collect available scene datetimes
-    scene_datetimes = []
-    if result.planting_scene and result.planting_scene.datetime:
-        scene_datetimes.append(result.planting_scene.datetime)
-    if result.harvest_scene and result.harvest_scene.datetime:
-        scene_datetimes.append(result.harvest_scene.datetime)
-
-    if scene_datetimes:
-        start_dt = min(scene_datetimes)
-        end_dt = max(scene_datetimes)
-        parent_item.properties["start_datetime"] = start_dt.isoformat()
-        parent_item.properties["end_datetime"] = end_dt.isoformat()
-
-    # Add cloud cover from child scenes to parent
-    if result.planting_scene:
-        parent_item.properties["ftw:planting_cloud_cover"] = round(
-            result.planting_scene.cloud_cover, 2
-        )
-    if result.harvest_scene:
-        parent_item.properties["ftw:harvest_cloud_cover"] = round(
-            result.harvest_scene.cloud_cover, 2
+    if source.name == DEFAULT_SOURCE:
+        _set_default_source_properties(
+            parent_item,
+            result,
+            cloud_cover_chip=cloud_cover_chip,
+            buffer_days=buffer_days,
+            num_buffer_expansions=num_buffer_expansions,
+            buffer_expansion_size=buffer_expansion_size,
         )
 
-    # Drop any previous season links and visual assets: a rerun that no longer
+    # Drop this source's previous season links and assets: a rerun that no longer
     # finds a scene for a season must not leave the old one behind.
+    stale_rels = {"ftw:planting", "ftw:harvest"}
+    if source.name == DEFAULT_SOURCE:
+        stale_rels.add("derived")
     parent_item.links = [
         link
         for link in parent_item.links
-        if link.rel not in ("ftw:planting", "ftw:harvest", "derived")
+        if link.rel not in stale_rels
+        or (link.rel != "derived" and link_source(link) != source.name)
     ]
     for season in SEASONS:
-        parent_item.assets.pop(f"{season}_visual", None)
-
-    # Drop imagery assets from the scene being replaced; they describe the old
-    # selection's GeoTIFFs and are re-added when the new scenes are downloaded.
-    for key in IMAGERY_ASSET_KEYS:
+        parent_item.assets.pop(parent_asset_key(season, "visual", source.name), None)
+    for key in imagery_asset_keys(source.name):
         parent_item.assets.pop(key, None)
 
     # Create each season's child item, then link and mirror it onto the parent.
@@ -139,6 +126,7 @@ def create_child_items_from_selection(
     # set on it, and losing them because one season's child could not be written
     # would leave the chip looking unselected on the next run.
     scenes = {"planting": result.planting_scene, "harvest": result.harvest_scene}
+    buffers = {"planting": result.planting_buffer_used, "harvest": result.harvest_buffer_used}
     try:
         for season in SEASONS:
             scene = scenes[season]
@@ -150,10 +138,60 @@ def create_child_items_from_selection(
                 scene=scene,
                 season=season,
                 year=year,
+                source=source,
+                buffer_used=buffers[season],
             )
             attach_season_to_parent(parent_item, child_item, season, chip_dir=chip_dir)
     finally:
         write_item(parent_item, parent_path)
+
+
+def _set_default_source_properties(
+    parent_item: pystac.Item,
+    result: SceneSelectionResult,
+    *,
+    cloud_cover_chip: float,
+    buffer_days: int,
+    num_buffer_expansions: int,
+    buffer_expansion_size: int,
+) -> None:
+    properties = parent_item.properties
+    properties["ftw:stac_host"] = (result.selection_params or {}).get("stac_host", "earthsearch")
+    properties["ftw:cloud_cover_chip_threshold"] = cloud_cover_chip
+    properties["ftw:buffer_days"] = buffer_days
+    properties["ftw:num_buffer_expansions"] = num_buffer_expansions
+    properties["ftw:buffer_expansion_size"] = buffer_expansion_size
+    properties["ftw:planting_buffer_used"] = result.planting_buffer_used
+    properties["ftw:harvest_buffer_used"] = result.harvest_buffer_used
+    properties["ftw:expansions_performed"] = result.expansions_performed
+
+    scenes = [scene for scene in (result.planting_scene, result.harvest_scene) if scene]
+    scene_datetimes = [scene.datetime for scene in scenes if scene.datetime]
+    if scene_datetimes:
+        properties["start_datetime"] = min(scene_datetimes).isoformat()
+        properties["end_datetime"] = max(scene_datetimes).isoformat()
+    for scene in scenes:
+        properties[f"ftw:{scene.season}_cloud_cover"] = round(scene.cloud_cover, 2)
+
+
+def _provenance(scene: SelectedScene, buffer_used: int | None) -> dict:
+    """Where the season's pixels come from and how the chip was rated."""
+    properties: dict = {
+        "ftw:scene_id": scene.item.id,
+        "ftw:cloud_cover_source": scene.cloud_cover_source,
+    }
+    optional = {
+        "ftw:scene_cloud_cover": scene.scene_cloud_cover,
+        "ftw:nodata_pct": scene.nodata,
+    }
+    properties.update({k: round(v, 2) for k, v in optional.items() if v is not None})
+    if scene.cloud_mask:
+        properties["ftw:cloud_mask"] = scene.cloud_mask
+    if buffer_used is not None:
+        properties["ftw:buffer_used"] = buffer_used
+    if scene.clear_candidates is not None:
+        properties["ftw:clear_candidates"] = scene.clear_candidates
+    return properties
 
 
 def _create_season_child_item(
@@ -162,22 +200,13 @@ def _create_season_child_item(
     scene: SelectedScene,
     season: Literal["planting", "harvest"],
     year: int,
+    source: ImagerySource | None = None,
+    buffer_used: int | None = None,
 ) -> pystac.Item:
-    """Create a child STAC item for a season (planting or harvest).
+    """Create and write the child STAC item for one season's scene."""
+    source = source or Sentinel2Source()
+    child_id = child_item_id(parent_item.id, season, source.name)
 
-    Args:
-        chip_dir: Directory containing the chip STAC items
-        parent_item: Parent chip STAC item
-        scene: Selected scene for this season
-        season: Season identifier
-        year: Calendar year for the crop cycle
-
-    Returns:
-        The child item that was written.
-    """
-    child_id = f"{parent_item.id}_{season}_s2"
-
-    # Create child item
     child_path = chip_dir / f"{child_id}.json"
     child_item = pystac.Item(
         id=child_id,
@@ -186,22 +215,18 @@ def _create_season_child_item(
         datetime=scene.datetime,
         properties={
             "ftw:season": season,
-            "ftw:source": "sentinel-2",
+            "ftw:source": source.name,
             "ftw:calendar_year": year,
+            **_provenance(scene, buffer_used),
+            **source.child_properties(scene.item),
         },
     )
 
     # Set self_href before adding links (required for relative link resolution)
     child_item.set_self_href(str(child_path))
 
-    # Copy relevant band assets from source scene
-    for band in CHILD_ITEM_BANDS:
-        if band in scene.item.assets:
-            child_item.assets[band] = scene.item.assets[band].clone()
-
-    # Add cloud probability asset if available
-    if "cloud" in scene.item.assets:
-        child_item.assets["cloud_probability"] = scene.item.assets["cloud"].clone()
+    for key, asset in source.child_assets(scene.item).items():
+        child_item.add_asset(key, asset)
 
     # Add links
     child_item.add_link(
@@ -221,7 +246,7 @@ def _create_season_child_item(
             )
         )
 
-    # Always include eo:cloud_cover, rounded to 2 decimal places
+    # Cloud cover over the chip footprint (the item's geometry), not the whole scene
     child_item.properties["eo:cloud_cover"] = round(scene.cloud_cover, 2)
 
     _copy_hierarchical_links(parent_item, child_item)
@@ -260,7 +285,9 @@ def _copy_hierarchical_links(parent_item: pystac.Item, child_item: pystac.Item) 
 
 
 def _scene_id(child_item: pystac.Item) -> str | None:
-    """The source scene's id, read from the child's ``via`` link to the source catalog."""
+    """The source scene's id, from ``ftw:scene_id`` or the child's ``via`` link."""
+    if child_item.properties.get("ftw:scene_id"):
+        return child_item.properties["ftw:scene_id"]
     link = child_item.get_single_link("via")
     href = link.get_href(transform_href=False) if link else None
     if not href:
@@ -272,6 +299,7 @@ def _attach_visual_asset(
     parent_item: pystac.Item,
     child_item: pystac.Item,
     season: Literal["planting", "harvest"],
+    source: str = DEFAULT_SOURCE,
 ) -> None:
     """Mirror the child's true-colour scene COG onto the parent as ``<season>_visual``.
 
@@ -297,7 +325,7 @@ def _attach_visual_asset(
     if scene_datetime:
         asset.extra_fields["datetime"] = scene_datetime
 
-    parent_item.add_asset(f"{season}_visual", asset)
+    parent_item.add_asset(parent_asset_key(season, "visual", source), asset)
 
 
 def _band_list_from(asset: pystac.Asset, fallback_title: str | None) -> str | None:
@@ -323,6 +351,7 @@ def _attach_local_image_asset(
     season: Literal["planting", "harvest"],
     chip_dir: Path,
     *,
+    source: str = DEFAULT_SOURCE,
     checksums: bool = False,
 ) -> None:
     """Restore the parent's ``<season>_image`` asset from the child's clipped image.
@@ -338,19 +367,19 @@ def _attach_local_image_asset(
     if not image_path.exists():
         return
 
+    label = f"{season.capitalize()} season imagery"
+    if source != DEFAULT_SOURCE:
+        label = f"{season.capitalize()} season {source_class(source).title} imagery"
     asset = pystac.Asset(
-        href=f"./{filename}",
-        media_type=MEDIA_TYPE_COG,
-        title=f"{season.capitalize()} season imagery",
-        roles=["data"],
+        href=f"./{filename}", media_type=MEDIA_TYPE_COG, title=label, roles=["data"]
     )
-    parent_item.add_asset(f"{season}_image", asset)
+    parent_item.add_asset(parent_asset_key(season, "image", source), asset)
     add_file_info(asset, image_path, checksum=checksums)
     add_raster_bands(asset, image_path)
 
     band_list = _band_list_from(asset, image.title)
     if band_list:
-        asset.title = f"{season.capitalize()} season imagery ({band_list})"
+        asset.title = f"{label} ({band_list})"
 
 
 def attach_season_to_parent(
@@ -381,18 +410,25 @@ def attach_season_to_parent(
         self_href = parent_item.get_self_href()
         chip_dir = Path(self_href).parent if self_href else Path()
 
-    parent_item.links = [link for link in parent_item.links if link.rel != f"ftw:{season}"]
+    source = child_item.properties.get("ftw:source", DEFAULT_SOURCE)
+    rel = f"ftw:{season}"
+    parent_item.links = [
+        link for link in parent_item.links if not (link.rel == rel and link_source(link) == source)
+    ]
     parent_item.add_link(
         pystac.Link(
-            rel=f"ftw:{season}",
+            rel=rel,
             target=f"./{child_item.id}.json",
             media_type="application/json",
-            title=f"{season.capitalize()} season Sentinel-2 imagery",
+            title=f"{season.capitalize()} season {source_class(source).title} imagery",
+            extra_fields={"ftw:source": source},
         )
     )
 
-    _attach_visual_asset(parent_item, child_item, season)
-    _attach_local_image_asset(parent_item, child_item, season, chip_dir, checksums=checksums)
+    _attach_visual_asset(parent_item, child_item, season, source)
+    _attach_local_image_asset(
+        parent_item, child_item, season, chip_dir, source=source, checksums=checksums
+    )
 
 
 #: Chip preview candidates, in the order ``image_download`` itself prefers them:
@@ -413,6 +449,15 @@ _THUMBNAIL_CANDIDATES = (
     ),
     ("_overlay.jpg", LEGACY_PREVIEW_MEDIA_TYPE, "Chip preview with field overlay"),
     ("_planting_image_s2.jpg", LEGACY_PREVIEW_MEDIA_TYPE, "Chip preview (planting season)"),
+    *(
+        (
+            f"_planting_image_{cls.suffix}{PREVIEW_SUFFIX}",
+            PREVIEW_MEDIA_TYPE,
+            "Chip preview (planting season)",
+        )
+        for name, cls in SOURCES.items()
+        if name != DEFAULT_SOURCE
+    ),
 )
 
 
@@ -452,8 +497,8 @@ def attach_existing_seasons(
 
     The STAC stage rebuilds every chip item from the mask files alone, which would
     otherwise drop the season links and imagery assets that the select/download
-    stages added. This reads whichever ``<chip>_<season>_s2.json`` children are
-    present and puts them back, along with the chip's preview thumbnail.
+    stages added. This reads whichever ``<chip>_<season>_<source>.json`` children
+    are present and puts them back, along with the chip's preview thumbnail.
 
     A child that cannot be parsed -- half-written by an interrupted run, or
     truncated -- is skipped rather than raised: the season is then treated as
@@ -466,20 +511,22 @@ def attach_existing_seasons(
         checksums: Also compute ``file:checksum`` for the re-attached local files
 
     Returns:
-        The seasons that were re-attached, in order.
+        The seasons that were re-attached for any source, in order.
     """
     attached: list[str] = []
     for season in SEASONS:
-        child_path = chip_dir / f"{parent_item.id}_{season}_s2.json"
-        if not child_path.exists():
-            continue
-        try:
-            child_item = pystac.Item.from_file(str(child_path))
-        except Exception:
-            continue
-        attach_season_to_parent(
-            parent_item, child_item, season, chip_dir=chip_dir, checksums=checksums
-        )
-        attached.append(season)
+        for source in SOURCES:
+            child_path = chip_dir / f"{child_item_id(parent_item.id, season, source)}.json"
+            if not child_path.exists():
+                continue
+            try:
+                child_item = pystac.Item.from_file(str(child_path))
+            except Exception:
+                continue
+            attach_season_to_parent(
+                parent_item, child_item, season, chip_dir=chip_dir, checksums=checksums
+            )
+            if season not in attached:
+                attached.append(season)
     attach_thumbnail_to_parent(parent_item, chip_dir, checksums=checksums)
     return attached

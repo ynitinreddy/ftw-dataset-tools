@@ -15,6 +15,7 @@ from ftw_dataset_tools.api.imagery import (
     select_imagery_for_catalog,
 )
 from ftw_dataset_tools.api.imagery.parallel import DEFAULT_WORKERS, MAX_WORKERS
+from ftw_dataset_tools.api.imagery.sources import DEFAULT_SOURCE, SOURCE_NAMES, build_source
 from ftw_dataset_tools.api.pipeline import docs_summary_line
 from ftw_dataset_tools.api.stac import detect_datetime_column, get_year_from_datetime_column
 
@@ -93,8 +94,16 @@ from ftw_dataset_tools.api.stac import detect_datetime_column, get_year_from_dat
     type=click.Choice(["parquet", "earth-search"]),
     default="parquet",
     show_default=True,
-    help="Scene search backend for imagery selection: the Sentinel-2 STAC-GeoParquet "
+    help="Scene search backend for Sentinel-2 imagery selection: the STAC-GeoParquet "
     "mirror (no API, no rate limit) or the Earth Search STAC API.",
+)
+@click.option(
+    "--image-source",
+    type=click.Choice(SOURCE_NAMES),
+    default=DEFAULT_SOURCE,
+    show_default=True,
+    help="Imagery source to select (and download) from. planetscope needs the "
+    "[planet] extra and PL_API_KEY.",
 )
 @click.option(
     "--skip-reproject",
@@ -224,6 +233,7 @@ def create_dataset_cmd(
     num_workers: int | None,
     image_workers: int,
     search_backend: str,
+    image_source: str,
     skip_reproject: bool,
     year: int | None,
     skip_images: bool,
@@ -395,6 +405,7 @@ def create_dataset_cmd(
                 force=force_image_selection,
                 workers=image_workers,
                 search_backend=search_backend,
+                source=build_source(image_source, search_backend=search_backend),
             )
 
             click.echo(f"  Selected: {selection.successful}")
@@ -418,6 +429,7 @@ def create_dataset_cmd(
                 resolution=resolution,
                 resume=True,
                 workers=image_workers,
+                source=image_source,
             )
 
             click.echo(f"  Downloaded: {download_stats.successful}")

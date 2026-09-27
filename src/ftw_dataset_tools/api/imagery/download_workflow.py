@@ -18,12 +18,14 @@ from ftw_dataset_tools.api.imagery.image_download import (
     download_and_clip_scene,
     process_downloaded_scene,
 )
+from ftw_dataset_tools.api.imagery.naming import image_filename, parse_child_id
 from ftw_dataset_tools.api.imagery.parallel import (
     DEFAULT_WORKERS,
     ParallelOutcome,
     run_in_parallel,
 )
 from ftw_dataset_tools.api.imagery.scene_selection import SelectedScene
+from ftw_dataset_tools.api.imagery.sources import DEFAULT_SOURCE, build_source
 from ftw_dataset_tools.api.imagery.thumbnails import has_rgb_bands
 
 if TYPE_CHECKING:
@@ -31,13 +33,16 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from ftw_dataset_tools.api.imagery.image_download import DownloadResult
+    from ftw_dataset_tools.api.imagery.sources import ImagerySource
 
 __all__ = [
     "DownloadTask",
     "DownloadWorkflowResult",
+    "SourceCache",
     "build_download_task",
     "download_imagery_for_catalog",
     "download_task_scene",
+    "find_child_items",
     "find_s2_child_items",
     "skip_download_reason",
 ]
@@ -56,14 +61,12 @@ class DownloadWorkflowResult:
     failed_details: list[dict] = field(default_factory=list)
 
 
-def find_s2_child_items(
+def find_child_items(
     catalog_dir: Path,
     unreadable: list[dict] | None = None,
+    source: str | None = None,
 ) -> list[tuple[pystac.Item, Path]]:
-    """Find all S2 child items (planting/harvest) in a catalog directory.
-
-    Searches subdirectories for STAC item JSON files that end with
-    _planting_s2 or _harvest_s2.
+    """Find the season child items in a catalog directory, for one source or all.
 
     Args:
         catalog_dir: Path to the collection directory (holding collection.json),
@@ -73,26 +76,49 @@ def find_s2_child_items(
                     entries for item files that could not be parsed. An item that
                     cannot be read is otherwise invisible: it is not downloaded and
                     is counted nowhere, so pass this in to report it.
+        source: Only this source's children (default: every source)
 
     Returns:
-        List of (pystac.Item, item_path) tuples for each S2 child item found.
-        Returns empty list if no items found.
+        List of (pystac.Item, item_path) tuples for each child item found.
     """
     child_items = []
 
     for subdir in iter_chip_dirs(catalog_dir):
-        for json_file in subdir.glob("*_s2.json"):
+        for json_file in sorted(subdir.glob("*.json")):
+            ref = parse_child_id(json_file.stem)
+            if ref is None or (source is not None and ref.source != source):
+                continue
             try:
                 item = pystac.Item.from_file(str(json_file))
             except Exception as e:
                 if unreadable is not None:
                     unreadable.append({"item": json_file.stem, "error": f"Unreadable item: {e}"})
                 continue
-            # Only include child items (they have _planting_s2 or _harvest_s2 suffix)
-            if item.id.endswith("_planting_s2") or item.id.endswith("_harvest_s2"):
+            if parse_child_id(item.id) is not None:
                 child_items.append((item, json_file))
 
     return child_items
+
+
+def find_s2_child_items(
+    catalog_dir: Path,
+    unreadable: list[dict] | None = None,
+) -> list[tuple[pystac.Item, Path]]:
+    """Find the Sentinel-2 season child items in a catalog directory."""
+    return find_child_items(catalog_dir, unreadable, source=DEFAULT_SOURCE)
+
+
+class SourceCache:
+    """One configured source per name, built on first use."""
+
+    def __init__(self, source: ImagerySource | None = None, **options: object) -> None:
+        self._options = options
+        self._sources: dict[str, ImagerySource] = {source.name: source} if source else {}
+
+    def get(self, name: str) -> ImagerySource:
+        if name not in self._sources:
+            self._sources[name] = build_source(name, **self._options)  # type: ignore[arg-type]
+        return self._sources[name]
 
 
 def download_imagery_for_catalog(
@@ -104,8 +130,10 @@ def download_imagery_for_catalog(
     on_progress: Callable[[int, int], None] | None = None,
     show_progress_bar: bool = True,
     workers: int = DEFAULT_WORKERS,
+    source: str | None = None,
+    source_options: dict | None = None,
 ) -> DownloadWorkflowResult:
-    """Download imagery for all S2 child items in a catalog.
+    """Download imagery for all season child items in a catalog.
 
     This is the core orchestration function used by both `download-images` command
     and `create-dataset` pipeline.
@@ -127,6 +155,8 @@ def download_imagery_for_catalog(
         on_progress: Optional callback (current, total) for progress updates
         show_progress_bar: If True, show tqdm progress bar
         workers: Number of scenes to download concurrently
+        source: Only download this source's children (default: every source)
+        source_options: Keyword options for :func:`build_source` (e.g. Planet settings)
 
     Returns:
         DownloadWorkflowResult with success/skipped/failed counts and details
@@ -134,11 +164,12 @@ def download_imagery_for_catalog(
     band_list = list(bands) if bands is not None else list(DEFAULT_BANDS)
     result = DownloadWorkflowResult()
     can_generate_thumbnail = generate_thumbnails and has_rgb_bands(band_list)
+    sources = SourceCache(**(source_options or {}))
 
-    # Find all child S2 items; items whose JSON cannot be read are reported as
-    # failures rather than silently dropped from the run.
+    # Items whose JSON cannot be read are reported as failures rather than
+    # silently dropped from the run.
     unreadable: list[dict] = []
-    child_items = find_s2_child_items(catalog_dir, unreadable=unreadable)
+    child_items = find_child_items(catalog_dir, unreadable=unreadable, source=source)
     result.failed += len(unreadable)
     result.failed_details.extend(unreadable)
 
@@ -170,9 +201,12 @@ def download_imagery_for_catalog(
                 advance()
                 continue
             tasks.append(build_download_task(item, item_path))
+        resolved = {task.source: sources.get(task.source) for task in tasks}
 
         def work(task: DownloadTask) -> DownloadResult:
-            return download_task_scene(task, bands=band_list, resolution=resolution)
+            return download_task_scene(
+                task, bands=band_list, resolution=resolution, source=resolved[task.source]
+            )
 
         def apply(outcome: ParallelOutcome[DownloadTask, DownloadResult]) -> None:
             _record_download(
@@ -208,6 +242,7 @@ class DownloadTask:
     output_filename: str
     output_path: Path
     logs: list[str] = field(default_factory=list)
+    source: str = DEFAULT_SOURCE
 
 
 def skip_download_reason(item: pystac.Item, item_path: Path, *, resume: bool) -> str | None:
@@ -227,26 +262,30 @@ def skip_download_reason(item: pystac.Item, item_path: Path, *, resume: bool) ->
 
 
 def build_download_task(item: pystac.Item, item_path: Path) -> DownloadTask:
-    """Derive the season and output paths for one child item."""
-    season: Literal["planting", "harvest"] = (
-        "planting" if item.id.endswith("_planting_s2") else "harvest"
-    )
-    base_id = item.id.replace("_planting_s2", "").replace("_harvest_s2", "")
-    output_filename = f"{base_id}_{season}_image_s2.tif"
+    """Derive the season, source and output paths for one child item."""
+    ref = parse_child_id(item.id)
+    if ref is None:
+        raise ValueError(f"{item.id} is not a season child item")
+    output_filename = image_filename(ref.chip_id, ref.season, ref.source)
 
     return DownloadTask(
         item=item,
         item_path=item_path,
         bbox=tuple(item.bbox),
-        season=season,
-        base_id=base_id,
+        season=ref.season,
+        base_id=ref.chip_id,
         output_filename=output_filename,
         output_path=item_path.parent / output_filename,
+        source=ref.source,
     )
 
 
 def download_task_scene(
-    task: DownloadTask, *, bands: list[str], resolution: float
+    task: DownloadTask,
+    *,
+    bands: list[str],
+    resolution: float,
+    source: ImagerySource | None = None,
 ) -> DownloadResult:
     """Fetch and clip one scene.
 
@@ -268,6 +307,8 @@ def download_task_scene(
         bands=bands,
         resolution=resolution,
         on_progress=task.logs.append,
+        source=source or build_source(task.source),
+        child_path=task.item_path,
     )
 
 
@@ -291,6 +332,10 @@ def _record_download(
         return
 
     download_result = outcome.value
+    if download_result is not None and download_result.pending is True:
+        result.skipped += 1
+        result.skipped_details.append({"item": task.item.id, "reason": download_result.error})
+        return
     if download_result is None or not download_result.success:
         error = download_result.error if download_result else None
         result.failed += 1

@@ -23,6 +23,14 @@ from ftw_dataset_tools import __version__
 from ftw_dataset_tools.api import field_stats, splits
 from ftw_dataset_tools.api.chip_borders import DEFAULT_BORDER_GAP_CHIPS
 from ftw_dataset_tools.api.imagery.parallel import MAX_WORKERS
+from ftw_dataset_tools.api.imagery.settings import S2_COLLECTIONS
+from ftw_dataset_tools.api.imagery.sources import (
+    DEFAULT_BUNDLE,
+    DEFAULT_SOURCE,
+    PLANET_BUNDLES,
+    SOURCE_NAMES,
+    source_class,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -77,8 +85,10 @@ SEARCH_BACKENDS = ("parquet", "earth-search")
 DEFAULT_PARQUET_WORKERS = 16
 
 
-def default_selection_workers(search_backend: str) -> int:
-    """Default selection worker count for a scene search backend."""
+def default_selection_workers(search_backend: str, source: str = DEFAULT_SOURCE) -> int:
+    """Default selection worker count for an imagery source and its search backend."""
+    if source != DEFAULT_SOURCE:
+        return source_class(source).default_workers
     return DEFAULT_PARQUET_WORKERS if search_backend == "parquet" else DEFAULT_IMAGERY_WORKERS
 
 
@@ -429,12 +439,16 @@ class SelectImagesConfig:
     """Settings for the imagery selection stage."""
 
     enabled: bool = True
+    source: str = DEFAULT_SOURCE
     cloud_cover_chip: float = 2.0
     nodata_max: float = 0.0
     buffer_days: int = 14
     num_buffer_expansions: int = 3
     buffer_expansion_size: int = 14
     search_backend: str = "parquet"
+    s2_collection: str = "c1"
+    planet_bundle: str = DEFAULT_BUNDLE
+    record_candidates: bool = False
     # Chips are selected in parallel: each one costs several scene searches that
     # spend nearly all their time waiting on the network. None picks the
     # backend's default: 16 for the parquet mirror, 4 for Earth Search (which
@@ -446,7 +460,7 @@ class SelectImagesConfig:
         """The worker count to run with: explicit value, else the backend default."""
         if self.workers is not None:
             return self.workers
-        return default_selection_workers(self.search_backend)
+        return default_selection_workers(self.search_backend, self.source)
 
 
 @dataclass
@@ -465,6 +479,19 @@ class DownloadImagesConfig:
     resume: bool = True
     #: "clip" (default) or "preview"; see DOWNLOAD_MODES.
     mode: str = DOWNLOAD_MODE_CLIP
+    # PlanetScope orders: harmonize to Sentinel-2, and how long to wait for them.
+    # A run that stops waiting leaves the order recorded; the next run resumes it.
+    planet_harmonize: bool = True
+    planet_wait: bool = True
+    planet_timeout_minutes: float = 60.0
+
+    def source_options(self) -> dict:
+        """Keyword options for building the download stage's imagery sources."""
+        return {
+            "planet_harmonize": self.planet_harmonize,
+            "planet_wait": self.planet_wait,
+            "planet_timeout_minutes": self.planet_timeout_minutes,
+        }
 
 
 @dataclass
@@ -701,6 +728,7 @@ class DatasetConfig:
         if self.stages.select_images.workers is not None:
             _validate_workers(self.stages.select_images.workers, "stages.select_images.workers")
         _validate_workers(self.stages.download_images.workers, "stages.download_images.workers")
+        self._validate_imagery_source()
 
         mode = self.stages.download_images.mode
         if mode not in DOWNLOAD_MODES:
@@ -717,6 +745,25 @@ class DatasetConfig:
 
         if self.metadata is not None:
             self.metadata.validate()
+
+    def _validate_imagery_source(self) -> None:
+        select = self.stages.select_images
+        choices = {
+            "stages.select_images.source": (select.source, SOURCE_NAMES),
+            "stages.select_images.s2_collection": (select.s2_collection, tuple(S2_COLLECTIONS)),
+            "stages.select_images.planet_bundle": (select.planet_bundle, tuple(PLANET_BUNDLES)),
+        }
+        for key, (value, allowed) in choices.items():
+            if value not in allowed:
+                raise ConfigError(f"{key} must be one of {list(allowed)} (got {value!r})")
+        if not isinstance(select.record_candidates, bool):
+            raise ConfigError("stages.select_images.record_candidates must be true or false")
+        download = self.stages.download_images
+        if download.mode == DOWNLOAD_MODE_PREVIEW and select.source != DEFAULT_SOURCE:
+            raise ConfigError(
+                f"stages.download_images.mode 'preview' reads remote scene COGs, which the "
+                f"{select.source} source does not have; use mode 'clip'."
+            )
 
     # ---- provenance -----------------------------------------------------
 
