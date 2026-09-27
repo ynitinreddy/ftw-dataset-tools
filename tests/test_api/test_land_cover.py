@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import duckdb
 import geopandas as gpd
@@ -26,6 +26,9 @@ from ftw_dataset_tools.api.land_cover import (
     normalize_gzd,
     resolve_year,
 )
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 # A 1 km x 1 km tile at 10 m in UTM 33N, with its top-left corner on the zone's
 # central meridian at about 48.3 N (grid zone 33U).
@@ -274,7 +277,10 @@ class TestAddLandCover:
         tile = write_tile(tmp_path / "tile.tif", data)
         chips = write_chips(
             tmp_path / "chips.parquet",
-            {"ftw-33UXP0001": chip_polygon(0, 0, 50, 100), "ftw-33UXP0002": chip_polygon(60, 0, 40, 100)},
+            {
+                "ftw-33UXP0001": chip_polygon(0, 0, 50, 100),
+                "ftw-33UXP0002": chip_polygon(60, 0, 40, 100),
+            },
         )
 
         add_land_cover(chips, year=2021, source=LocalSource({"33U": {2021: str(tile)}}))
@@ -288,7 +294,9 @@ class TestAddLandCover:
         data[:, :30] = WATER
         data[:, 30:40] = TREES
         tile = write_tile(tmp_path / "tile.tif", data)
-        chips = write_chips(tmp_path / "chips.parquet", {"ftw-33UXP0001": chip_polygon(0, 0, 100, 100)})
+        chips = write_chips(
+            tmp_path / "chips.parquet", {"ftw-33UXP0001": chip_polygon(0, 0, 100, 100)}
+        )
 
         add_land_cover(chips, year=2021, source=LocalSource({"33U": {2021: str(tile)}}))
 
@@ -316,7 +324,9 @@ class TestAddLandCover:
         assert bbox == pytest.approx((xmin, ymin, xmax, ymax))
 
     @pytest.mark.parametrize("chips_per_read", [1, 2, 1000])
-    def test_task_size_does_not_change_the_result(self, tmp_path: Path, chips_per_read: int) -> None:
+    def test_task_size_does_not_change_the_result(
+        self, tmp_path: Path, chips_per_read: int
+    ) -> None:
         chips, tile = two_chip_setup(tmp_path)
         source = LocalSource({"33U": {2021: str(tile)}})
 
@@ -343,16 +353,16 @@ class TestAddLandCover:
         add_land_cover(chips, year=2021, source=LocalSource({"33U": {2021: str(tile)}}))
 
         con = duckdb.connect()
-        types = dict(
-            (row[0], row[1])
+        types = {
+            row[0]: row[1]
             for row in con.execute(f"DESCRIBE SELECT * FROM read_parquet('{chips}')").fetchall()
-        )
+        }
         con.close()
         assert types["landcover_year"] == "INTEGER"
         assert types["landcover_year_exact"] == "BOOLEAN"
         assert types["landcover_dominant_code"] == "BIGINT"
         assert types["landcover_dominant_pct"] == "DOUBLE"
-        assert types["landcover_classes"].startswith("STRUCT(code BIGINT, \"name\" VARCHAR")
+        assert types["landcover_classes"].startswith('STRUCT(code BIGINT, "name" VARCHAR')
 
     def test_geoparquet_metadata_and_row_order_survive(self, tmp_path: Path) -> None:
         from ftw_dataset_tools.api.geo import detect_crs, detect_geometry_column
@@ -360,7 +370,10 @@ class TestAddLandCover:
         tile = write_tile(tmp_path / "tile.tif")
         chips = write_chips(
             tmp_path / "chips.parquet",
-            {"ftw-33UXP0002": chip_polygon(80, 0, 20, 100), "ftw-33UXP0001": chip_polygon(0, 0, 70, 100)},
+            {
+                "ftw-33UXP0002": chip_polygon(80, 0, 20, 100),
+                "ftw-33UXP0001": chip_polygon(0, 0, 70, 100),
+            },
         )
 
         add_land_cover(chips, year=2021, source=LocalSource({"33U": {2021: str(tile)}}))
@@ -393,13 +406,15 @@ class TestAddLandCover:
 
         assert (result.chips_total, result.chips_with_land_cover) == (0, 0)
         assert source.calls == []
-        assert "landcover_classes" in [row[0] for row in duckdb.sql(f"DESCRIBE FROM '{chips}'").fetchall()]
+        assert "landcover_classes" in [
+            row[0] for row in duckdb.sql(f"DESCRIBE FROM '{chips}'").fetchall()
+        ]
 
     def test_rejects_projected_chips(self, tmp_path: Path) -> None:
         chips = tmp_path / "chips.parquet"
-        gpd.GeoDataFrame({"id": ["a"]}, geometry=[box(X0, Y0 - 100, X0 + 100, Y0)], crs=UTM).to_parquet(
-            chips
-        )
+        gpd.GeoDataFrame(
+            {"id": ["a"]}, geometry=[box(X0, Y0 - 100, X0 + 100, Y0)], crs=UTM
+        ).to_parquet(chips)
 
         with pytest.raises(ValueError, match="EPSG:4326"):
             add_land_cover(chips, year=2021, source=LocalSource({}))
@@ -475,12 +490,14 @@ class TestLandCoverSummary:
 class TestPlanetaryComputer:
     def test_one_real_chip(self, tmp_path: Path) -> None:
         """A 2 km chip near Linz, Austria reads the real IO 2021 map."""
-        chips = write_chips(tmp_path / "chips.parquet", {"ftw-33UVP0001": box(14.28, 48.29, 14.31, 48.31)})
+        chips = write_chips(
+            tmp_path / "chips.parquet", {"ftw-33UVP0001": box(14.28, 48.29, 14.31, 48.31)}
+        )
 
         result = add_land_cover(chips, year=2021)
 
         assert (result.chips_with_land_cover, result.years_used) == (1, (2021,))
-        year, exact, code, name, pct, classes = read_land_cover(chips)["ftw-33UVP0001"]
+        year, exact, code, name, _pct, classes = read_land_cover(chips)["ftw-33UVP0001"]
         assert (year, exact) == (2021, True)
         assert name == land_cover.IO_CLASSES[code]
         assert sum(c["pct"] for c in classes) == pytest.approx(100.0, abs=0.1)

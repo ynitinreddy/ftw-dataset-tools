@@ -192,9 +192,7 @@ class IOLulcSource:
 # ---- pixel counting -------------------------------------------------------
 
 
-def _pixel_window(
-    src: DatasetReader, bounds: tuple[float, float, float, float]
-) -> Window | None:
+def _pixel_window(src: DatasetReader, bounds: tuple[float, float, float, float]) -> Window | None:
     """Whole-pixel window covering ``bounds`` (in the dataset CRS), clipped to the raster."""
     left, bottom, right, top = bounds
     inverse = ~src.transform
@@ -274,8 +272,7 @@ def land_cover_summary(result: LandCoverResult | None) -> str:
     line = f"Land cover: {counted} from IO {years}"
     if result.chips_nearest_year:
         line += (
-            f" ({result.chips_nearest_year:,} nearest-year for dataset year "
-            f"{result.dataset_year})"
+            f" ({result.chips_nearest_year:,} nearest-year for dataset year {result.dataset_year})"
         )
     return line
 
@@ -472,9 +469,7 @@ def add_land_cover(
     con = duckdb.connect(":memory:")
     ensure_spatial_loaded(con)
     try:
-        con.execute(
-            f"CREATE TABLE chips_table AS {select_excluding(chips_path, OUTPUT_COLUMNS)}"
-        )
+        con.execute(f"CREATE TABLE chips_table AS {select_excluding(chips_path, OUTPUT_COLUMNS)}")
         total = con.execute("SELECT count(*) FROM chips_table").fetchone()[0]
         if year is None:
             log(f"Note: {NO_YEAR_REASON}; skipping land cover")
