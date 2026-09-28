@@ -3,19 +3,29 @@
 from __future__ import annotations
 
 import json
+import sys
+import urllib.error
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import ClassVar
 
 import numpy as np
 import pystac
 import pytest
 import rasterio
+from click.testing import CliRunner
+from pystac.extensions.eo import EOExtension
 from rasterio.transform import from_bounds
 
-from ftw_dataset_tools.api.imagery import catalog_ops, naming, scene_selection
+from ftw_dataset_tools.api.imagery import (
+    catalog_ops,
+    download_workflow,
+    image_download,
+    naming,
+    scene_selection,
+)
 from ftw_dataset_tools.api.imagery.crop_calendar import CropCalendarDates
 from ftw_dataset_tools.api.imagery.image_download import DownloadResult, download_and_clip_scene
 from ftw_dataset_tools.api.imagery.scene_selection import SceneSelectionResult, SelectedScene
@@ -25,13 +35,21 @@ from ftw_dataset_tools.api.imagery.sources import (
     SourceUnavailableError,
     build_source,
     planetscope,
+    sentinel2,
 )
-from ftw_dataset_tools.api.imagery.sources.base import ChipAssessment, FetchResult, SearchResult
+from ftw_dataset_tools.api.imagery.sources.base import (
+    ChipAssessment,
+    FetchResult,
+    ImagerySourceError,
+    SearchResult,
+    short_date,
+)
 from ftw_dataset_tools.api.imagery.stac_child_items import (
     attach_existing_seasons,
     create_child_items_from_selection,
 )
 from ftw_dataset_tools.api.stac_items import write_item
+from ftw_dataset_tools.cli import cli
 
 from .conftest import create_mock_s2_assets, create_mock_stac_item
 
@@ -55,6 +73,28 @@ def _planet_feature(item_id: str, acquired: str, cloud: float, bbox=BBOX) -> dic
             "gsd": 3.7,
         },
     }
+
+
+def _s2_item(item_id: str, cloud: float, **properties: object) -> pystac.Item:
+    item = create_mock_stac_item(
+        item_id,
+        bbox=BBOX,
+        properties={"eo:cloud_cover": cloud, **properties},
+        assets=create_mock_s2_assets(),
+    )
+    EOExtension.ext(item, add_if_missing=True)
+    return item
+
+
+def _write_collection(dataset_dir: Path) -> None:
+    pystac.Collection(
+        id="test-dataset",
+        description="Test dataset",
+        extent=pystac.Extent(
+            pystac.SpatialExtent([list(BBOX)]),
+            pystac.TemporalExtent([[datetime(2023, 1, 1, tzinfo=UTC), None]]),
+        ),
+    ).save_object(include_self_link=False, dest_href=str(dataset_dir / "collection.json"))
 
 
 class TestRegistryAndNaming:
@@ -111,6 +151,83 @@ class TestSentinel2Source:
             "red": ("https://example.com/data/red.tif", 1),
             "nir": ("https://example.com/data/nir.tif", 1),
         }
+
+    @pytest.mark.parametrize(
+        ("error", "retryable"),
+        [
+            (urllib.error.HTTPError("https://x", 503, "busy", {}, None), True),
+            (urllib.error.HTTPError("https://x", 404, "missing", {}, None), False),
+            (urllib.error.URLError("down"), True),
+            (ValueError("bad"), False),
+        ],
+    )
+    def test_only_transient_errors_are_retried(self, error: Exception, retryable: bool) -> None:
+        assert sentinel2._is_retryable(error) is retryable
+
+    def test_earth_search_retries_then_sorts_by_cloud(self, monkeypatch) -> None:
+        calls = []
+
+        def search(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise urllib.error.HTTPError("https://x", 503, "busy", {}, None)
+            return SimpleNamespace(items=lambda: iter([_s2_item("b", 30.0), _s2_item("a", 2.0)]))
+
+        monkeypatch.setattr(
+            sentinel2, "_get_stac_client", lambda _url: SimpleNamespace(search=search)
+        )
+        monkeypatch.setattr(sentinel2.time, "sleep", lambda _s: None)
+
+        result = sentinel2._query_stac(BBOX, datetime(2023, 5, 14, tzinfo=UTC), 20, 7)
+
+        assert [item.id for item in result.items] == ["a", "b"]
+        assert len(calls) == 2
+        assert result.collection == "sentinel-2-c1-l2a"
+
+    def test_earth_search_raises_permanent_errors_at_once(self, monkeypatch) -> None:
+        def search(**_kwargs):
+            raise urllib.error.HTTPError("https://x", 404, "missing", {}, None)
+
+        monkeypatch.setattr(
+            sentinel2, "_get_stac_client", lambda _url: SimpleNamespace(search=search)
+        )
+
+        with pytest.raises(urllib.error.HTTPError):
+            sentinel2._query_stac(BBOX, datetime(2023, 5, 14, tzinfo=UTC), 20, 7)
+
+    def test_nodata_is_not_checked_without_a_nir_band(self) -> None:
+        item = _s2_item("S2B_x", 1.0, **{"s2:nodata_pixel_percentage": 5.0})
+        del item.assets["nir"]
+
+        assert sentinel2._chip_nodata(item, BBOX, 10.0, lambda _m: None) == (False, None)
+
+    def test_cloudy_scene_is_rated_with_scl(self, monkeypatch) -> None:
+        item = _s2_item("S2B_x", 40.0, **{"s2:nodata_pixel_percentage": 0.0})
+        monkeypatch.setattr(sentinel2, "calculate_pixel_cloud_cover", lambda **_kw: 3.0)
+
+        assessment = Sentinel2Source().assess(item, BBOX, 5.0, lambda _m: None)
+
+        assert assessment == ChipAssessment(3.0, "pixel", cloud_mask="scl", nodata=0.0)
+
+    def test_scl_failure_falls_back_to_scene_cloud(self, monkeypatch) -> None:
+        item = _s2_item("S2B_x", 40.0, **{"s2:nodata_pixel_percentage": 0.0})
+
+        def fail(**_kwargs):
+            raise OSError("unreadable")
+
+        monkeypatch.setattr(sentinel2, "calculate_pixel_cloud_cover", fail)
+
+        assessment = Sentinel2Source().assess(item, BBOX, 5.0, lambda _m: None)
+
+        assert (assessment.cloud_cover, assessment.cloud_cover_source) == (40.0, "scene")
+
+    def test_scene_without_scl_uses_scene_cloud(self) -> None:
+        item = _s2_item("S2B_x", 40.0, **{"s2:nodata_pixel_percentage": 0.0})
+        del item.assets["scl"]
+
+        assessment = Sentinel2Source().assess(item, BBOX, 5.0, lambda _m: None)
+
+        assert (assessment.cloud_cover, assessment.cloud_cover_source) == (40.0, "scene")
 
 
 @pytest.fixture
@@ -257,6 +374,117 @@ class TestPlanetScopeSource:
         with pytest.raises(SourceUnavailableError, match="PL_API_KEY"):
             planetscope._planet_client()
 
+    def test_client_is_created_once_per_thread(self, monkeypatch) -> None:
+        sdk = ModuleType("planet")
+        sdk.Planet = lambda: object()
+        monkeypatch.setenv("PL_API_KEY", "key")
+        monkeypatch.setattr(planetscope, "_CLIENTS", SimpleNamespace())
+        monkeypatch.setitem(sys.modules, "planet", sdk)
+
+        assert planetscope._planet_client() is planetscope._planet_client()
+
+    def test_missing_sdk_is_reported(self, monkeypatch) -> None:
+        monkeypatch.setenv("PL_API_KEY", "key")
+        monkeypatch.setattr(planetscope, "_CLIENTS", SimpleNamespace())
+        monkeypatch.setitem(sys.modules, "planet", None)
+
+        with pytest.raises(SourceUnavailableError, match="Planet SDK"):
+            planetscope._planet_client()
+
+    def test_sparse_search_result_and_child_properties(self) -> None:
+        full = planetscope._to_item(_planet_feature("a", "2023-05-14T10:00:00Z", 0.1))
+        feature = _planet_feature("b", "2023-05-14T10:00:00Z", 0.1)
+        feature["properties"] = {"acquired": "2023-05-14T10:00:00Z"}
+        sparse = planetscope._to_item(feature)
+        source = PlanetScopeSource()
+
+        assert source.child_properties(full)["platform"] == "24a1"
+        assert source.child_properties(full)["instruments"] == ["PSB.SD"]
+        assert "eo:cloud_cover" not in sparse.properties
+        assert source.scene_cloud_cover(sparse) == 0.0
+        assert source.child_properties(sparse) == {
+            "constellation": "planetscope",
+            "gsd": 3.0,
+            "ftw:planet_item_type": "PSScene",
+            "ftw:planet_bundle": "analytic_sr_udm2",
+        }
+
+    def test_scene_id_falls_back_to_the_via_link(self) -> None:
+        child = create_mock_stac_item("chip_001_planting_planet", bbox=BBOX)
+        child.add_link(pystac.Link("via", f"{planetscope.PLANET_DATA_URL}/items/scene-9"))
+
+        assert planetscope._scene_id(child) == "scene-9"
+
+        child.clear_links("via")
+        with pytest.raises(ImagerySourceError, match="records no source scene"):
+            planetscope._scene_id(child)
+
+    def test_udm2_coverage_is_polled_until_complete(self, monkeypatch) -> None:
+        bodies = [{"status": "running"}, {"status": "complete", "clear_percent": 88.5}]
+
+        def post(*_args, **_kwargs):
+            body = bodies.pop(0)
+            return SimpleNamespace(raise_for_status=lambda: None, json=lambda: body)
+
+        monkeypatch.setenv("PL_API_KEY", "key")
+        monkeypatch.setitem(sys.modules, "httpx", SimpleNamespace(post=post))
+
+        assert PlanetScopeSource(poll_seconds=0)._chip_clear_percent("a", BBOX) == 88.5
+
+    def test_udm2_coverage_that_never_completes_raises(self, monkeypatch) -> None:
+        response = SimpleNamespace(
+            raise_for_status=lambda: None, json=lambda: {"status": "running"}
+        )
+        monkeypatch.setenv("PL_API_KEY", "key")
+        monkeypatch.setitem(sys.modules, "httpx", SimpleNamespace(post=lambda *_a, **_k: response))
+
+        with pytest.raises(ImagerySourceError, match="did not complete"):
+            PlanetScopeSource(poll_seconds=0)._chip_clear_percent("a", BBOX)
+
+    def test_waits_for_a_running_order(self, fake_planet, tmp_path: Path) -> None:
+        fake_planet.states = ["queued", "running", "success"]
+        child, path = _planet_child(tmp_path)
+        messages: list[str] = []
+
+        fetched = PlanetScopeSource(poll_seconds=0, harmonize=False).fetch(
+            child, path, ["red"], messages.append
+        )
+
+        assert fetched.status == "ready"
+        assert "Planet order order-1: running" in messages
+        assert [next(iter(tool)) for tool in fake_planet.created[0]["tools"]] == ["clip"]
+
+    @pytest.mark.usefixtures("fake_planet")
+    def test_order_without_analytic_image_fails(self, tmp_path: Path) -> None:
+        client = planetscope._planet_client()
+        client.orders.download_order = lambda _id, directory, **_kw: [directory / "x_udm2.tif"]
+        child, path = _planet_child(tmp_path)
+
+        fetched = PlanetScopeSource().fetch(child, path, ["red"], lambda _m: None)
+
+        assert fetched.status == "failed"
+        assert "delivered no analytic image" in fetched.error
+
+    def test_fetch_needs_the_child_path(self, tmp_path: Path) -> None:
+        child, _path = _planet_child(tmp_path)
+
+        fetched = PlanetScopeSource().fetch(child, None, ["red"], lambda _m: None)
+
+        assert (fetched.status, fetched.error) == (
+            "failed",
+            "PlanetScope downloads need the child item path",
+        )
+
+    def test_missing_credentials_stop_the_fetch(self, monkeypatch, tmp_path: Path) -> None:
+        def unavailable():
+            raise SourceUnavailableError("Set PL_API_KEY")
+
+        monkeypatch.setattr(planetscope, "_planet_client", unavailable)
+        child, path = _planet_child(tmp_path)
+
+        with pytest.raises(SourceUnavailableError):
+            PlanetScopeSource().fetch(child, path, ["red"], lambda _m: None)
+
 
 @dataclass
 class FakeSource:
@@ -266,6 +494,7 @@ class FakeSource:
     cloud: dict[str, float]
     band_file: Path | None = None
     searches: list[int] = field(default_factory=list)
+    cleanup: list[Path] = field(default_factory=list)
 
     name: ClassVar[str] = "planetscope"
     suffix: ClassVar[str] = "planet"
@@ -292,7 +521,9 @@ class FakeSource:
 
     def fetch(self, _child, _path, bands, _log) -> FetchResult:
         return FetchResult(
-            "ready", {band: (str(self.band_file), i + 1) for i, band in enumerate(bands)}
+            "ready",
+            {band: (str(self.band_file), i + 1) for i, band in enumerate(bands)},
+            cleanup=self.cleanup,
         )
 
 
@@ -360,6 +591,86 @@ class TestSelectionWithASource:
         assert not result.success
         assert result.expansions_performed == 1
         assert result.planting_buffer_used == 14
+
+    def test_only_the_missing_season_is_searched_again(self) -> None:
+        @dataclass
+        class PlantingOnly(FakeSource):
+            def search(self, bbox, center, buffer_days) -> SearchResult:
+                result = super().search(bbox, center, buffer_days)
+                return result if center.month < 8 else SearchResult([])
+
+        source = PlantingOnly(items=[_scene_item("clear", 9, 0.1)], cloud={"clear": 0.0})
+        result = scene_selection.select_scenes_for_chip(
+            "chip",
+            BBOX,
+            2021,
+            source=source,
+            buffer_days=7,
+            buffer_expansion_size=7,
+            num_buffer_expansions=1,
+        )
+
+        assert result.planting_scene.id == "clear"
+        assert result.skipped_reason == "No cloud-free harvest scene found"
+        assert (result.planting_buffer_used, result.harvest_buffer_used) == (7, 14)
+        assert source.searches == [7, 7, 14]
+
+    def test_query_error_stops_the_search(self) -> None:
+        source = FakeSource(items=[], cloud={})
+        result = scene_selection.select_scenes_for_chip("chip", BBOX, 2999, source=source)
+
+        assert result.skipped_reason.startswith("Planting query error: Query date range")
+        assert source.searches == []
+
+
+class TestSceneHelpers:
+    def test_datetime_falls_back_to_start_datetime(self) -> None:
+        item = _scene_item("a", 9, 0.0)
+        item.datetime = None
+        item.properties["start_datetime"] = "2021-06-09T10:00:00Z"
+
+        assert scene_selection._get_item_datetime(item) == datetime(2021, 6, 9, 10, tzinfo=UTC)
+
+    @pytest.mark.parametrize(
+        ("start", "match"), [(None, "no datetime"), (20210609, "invalid start_datetime")]
+    )
+    def test_unusable_datetime_raises(self, start, match: str) -> None:
+        item = _scene_item("a", 9, 0.0)
+        item.datetime = None
+        item.properties.pop("datetime", None)
+        item.properties["start_datetime"] = start
+
+        with pytest.raises(ValueError, match=match):
+            scene_selection._get_item_datetime(item)
+
+    def test_undated_candidate_is_skipped(self) -> None:
+        item = _scene_item("a", 9, 0.0)
+        item.datetime = None
+        messages: list[str] = []
+
+        scene = scene_selection._select_best_scene(
+            [item], "planting", BBOX, source=FakeSource([], {"a": 0.0}), on_progress=messages.append
+        )
+
+        assert scene is None
+        assert any("a: skipping" in message for message in messages)
+
+    @pytest.mark.parametrize(
+        ("planting", "harvest", "reason"),
+        [
+            (None, "scene", "No cloud-free planting scene found"),
+            ("scene", None, "No cloud-free harvest scene found"),
+            ("scene", "scene", None),
+        ],
+    )
+    def test_skip_reason_names_the_missing_season(self, planting, harvest, reason) -> None:
+        assert scene_selection._skip_reason(planting, harvest) == reason
+
+    def test_short_date_of_an_undated_item_is_its_id(self) -> None:
+        item = _scene_item("20230514_101010_24a1", 9, 0.0)
+        item.datetime = None
+
+        assert short_date(item) == "20230514_101010"
 
 
 def _selection(source, scene_item: pystac.Item, cloud: float) -> SceneSelectionResult:
@@ -455,6 +766,62 @@ class TestPerSourceCatalog:
         assert catalog_ops.has_existing_scenes(fresh, "sentinel-2")
         assert catalog_ops.has_existing_scenes(fresh, "planetscope")
 
+    def test_rebuilt_parent_gets_the_downloaded_planet_image(self, two_source_chip) -> None:
+        chip_dir, _parent = two_source_chip
+        child_path = chip_dir / "chip_001_planting_planet.json"
+        child = pystac.Item.from_file(str(child_path))
+        _write_band_file(chip_dir / "chip_001_planting_image_planet.tif")
+        child.add_asset("image", pystac.Asset(href="./chip_001_planting_image_planet.tif"))
+        write_item(child, child_path)
+        fresh = create_mock_stac_item("chip_001", bbox=BBOX)
+
+        attach_existing_seasons(fresh, chip_dir)
+
+        asset = fresh.assets["planting_image_planet"]
+        assert asset.title == "Planting season PlanetScope imagery"
+
+    def test_imagery_stats_per_source(self, two_source_chip) -> None:
+        _chip_dir, parent = two_source_chip
+        planet = catalog_ops.get_imagery_stats([parent], "planetscope")
+        parent.properties.pop("ftw:planting_cloud_cover")
+        parent.properties.pop("ftw:harvest_cloud_cover")
+        s2 = catalog_ops.get_imagery_stats([parent])
+
+        assert (planet.with_imagery, planet.planting_cloud_covers) == (1, [])
+        assert (s2.with_imagery, s2.planting_cloud_covers, s2.harvest_cloud_covers) == (1, [], [])
+
+    def test_clearing_the_default_source_keeps_the_shared_crop_calendar(
+        self, two_source_chip
+    ) -> None:
+        _chip_dir, parent = two_source_chip
+
+        catalog_ops.clear_chip_selections(parent, "sentinel-2")
+
+        assert parent.properties["ftw:planting_day"] == 150
+        assert "ftw:planting_cloud_cover" not in parent.properties
+        assert catalog_ops.has_existing_scenes(parent, "planetscope")
+
+    def test_child_records_clear_candidates(self, tmp_path: Path) -> None:
+        parent = create_mock_stac_item("chip_002", bbox=BBOX)
+        item = planetscope._to_item(_planet_feature("scene-1", "2023-05-16T10:00:00Z", 0.1))
+        result = _selection(PlanetScopeSource(), item, 1.2)
+        candidates = [{"scene_id": "scene-1", "datetime": "2023-05-16", "cloud_cover": 1.2}]
+        result.planting_scene.clear_candidates = candidates
+
+        create_child_items_from_selection(tmp_path, parent, result, 2023, 2, 14)
+
+        child = json.loads((tmp_path / "chip_002_planting_planet.json").read_text())
+        assert child["properties"]["ftw:clear_candidates"] == candidates
+
+    def test_selection_without_scenes_sets_no_temporal_range(self, tmp_path: Path) -> None:
+        parent = create_mock_stac_item("chip_002", bbox=BBOX)
+        result = SceneSelectionResult("chip_002", BBOX, 2023, CropCalendarDates(150, 270))
+
+        create_child_items_from_selection(tmp_path, parent, result, 2023, 2, 14)
+
+        assert parent.properties["ftw:planting_day"] == 150
+        assert "start_datetime" not in parent.properties
+
 
 class TestPerSourceDownload:
     @pytest.mark.usefixtures("two_source_chip")
@@ -492,41 +859,143 @@ class TestPerSourceDownload:
         assert (result.skipped, result.failed, result.successful) == (2, 0, 0)
 
     def test_clip_writes_provenance_tags_and_reads_band_indices(self, tmp_path: Path) -> None:
-        band_file = tmp_path / "order.tif"
-        transform = from_bounds(*BBOX, 20, 20)
-        with rasterio.open(
-            band_file,
-            "w",
-            driver="GTiff",
-            width=20,
-            height=20,
-            count=2,
-            dtype="uint16",
-            crs="EPSG:4326",
-            transform=transform,
-        ) as dst:
-            dst.write(np.full((20, 20), 111, dtype="uint16"), 1)
-            dst.write(np.full((20, 20), 222, dtype="uint16"), 2)
-
-        child = create_mock_stac_item(
-            "chip_001_planting_planet",
-            bbox=BBOX,
-            properties={"ftw:source": "planetscope", "ftw:scene_id": "scene-1"},
-        )
-        scene = SelectedScene(child, "planting", 1.0, child.datetime, "")
         output = tmp_path / "chip_001_planting_image_planet.tif"
-
-        result = download_and_clip_scene(
-            scene,
-            BBOX,
-            output,
-            ["red", "nir"],
-            resolution=100.0,
-            source=FakeSource([], {}, band_file=band_file),
-        )
+        band_file = _write_band_file(tmp_path / "order.tif")
+        result = _clip(output, FakeSource([], {}, band_file=band_file))
 
         assert result.success, result.error
         with rasterio.open(output) as src:
             assert src.tags()["FTW_SCENE_ID"] == "scene-1"
             assert src.tags()["FTW_SOURCE"] == "planetscope"
             assert (src.read(1).max(), src.read(2).max()) == (111, 222)
+
+    def test_fetched_workdir_is_removed_after_clipping(self, tmp_path: Path) -> None:
+        workdir = tmp_path / ".planet" / "order-1"
+        workdir.mkdir(parents=True)
+        band_file = _write_band_file(tmp_path / "order.tif")
+        source = FakeSource([], {}, band_file=band_file, cleanup=[workdir])
+
+        result = _clip(tmp_path / "out.tif", source)
+
+        assert result.success, result.error
+        assert not workdir.exists()
+
+    def test_write_failure_is_reported(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setattr(image_download, "write_cog", lambda *_a, **_k: "disk full")
+        source = FakeSource([], {}, band_file=_write_band_file(tmp_path / "order.tif"))
+
+        result = _clip(tmp_path / "out.tif", source)
+
+        assert (result.success, result.error) == (False, "disk full")
+
+    def test_non_child_item_has_no_download_task(self, tmp_path: Path) -> None:
+        item = create_mock_stac_item("chip_001", bbox=BBOX)
+
+        with pytest.raises(ValueError, match="not a season child item"):
+            download_workflow.build_download_task(item, tmp_path / "chip_001.json")
+
+    def test_child_file_holding_another_item_is_ignored(self, tmp_path: Path) -> None:
+        chip_dir = tmp_path / "chips" / "32TNT" / "chip_001"
+        chip_dir.mkdir(parents=True)
+        write_item(create_mock_stac_item("chip_001"), chip_dir / "chip_001_planting_s2.json")
+
+        assert download_workflow.find_child_items(tmp_path) == []
+
+    @pytest.mark.usefixtures("two_source_chip")
+    def test_missing_credentials_stop_the_download(self, tmp_path: Path, monkeypatch) -> None:
+        def unavailable(**_kwargs):
+            raise SourceUnavailableError("Set PL_API_KEY to use the planetscope source.")
+
+        monkeypatch.setattr(download_workflow, "download_and_clip_scene", unavailable)
+        _write_collection(tmp_path)
+
+        with pytest.raises(SourceUnavailableError):
+            download_workflow.download_imagery_for_catalog(
+                tmp_path, show_progress_bar=False, workers=1, source="planetscope"
+            )
+        result = CliRunner().invoke(
+            cli, ["download-images", str(tmp_path), "--source", "planetscope", "--workers", "1"]
+        )
+
+        assert result.exit_code == 1
+        assert result.output.count("PL_API_KEY") == 1
+
+    @pytest.mark.usefixtures("two_source_chip")
+    def test_cli_counts_pending_orders_as_skipped(self, tmp_path: Path, monkeypatch) -> None:
+        def pending(*, scene, output_path, **_kwargs) -> DownloadResult:
+            return DownloadResult(
+                output_path, scene.id, scene.season, [], 0, 0, "", False, "order running", True
+            )
+
+        monkeypatch.setattr(download_workflow, "download_and_clip_scene", pending)
+        _write_collection(tmp_path)
+
+        result = CliRunner().invoke(
+            cli, ["download-images", str(tmp_path), "--source", "planetscope", "--workers", "1"]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "Skipped: 2" in result.output
+        assert "Failed: 0" in result.output
+
+
+def _write_band_file(path: Path) -> Path:
+    """A two-band GeoTIFF over BBOX holding 111 and 222."""
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        width=20,
+        height=20,
+        count=2,
+        dtype="uint16",
+        crs="EPSG:4326",
+        transform=from_bounds(*BBOX, 20, 20),
+    ) as dst:
+        dst.write(np.full((20, 20), 111, dtype="uint16"), 1)
+        dst.write(np.full((20, 20), 222, dtype="uint16"), 2)
+    return path
+
+
+def _clip(output: Path, source: FakeSource) -> DownloadResult:
+    child = create_mock_stac_item(
+        "chip_001_planting_planet",
+        bbox=BBOX,
+        properties={"ftw:source": "planetscope", "ftw:scene_id": "scene-1"},
+    )
+    scene = SelectedScene(child, "planting", 1.0, child.datetime, "")
+    return download_and_clip_scene(
+        scene, BBOX, output, ["red", "nir"], resolution=100.0, source=source
+    )
+
+
+class TestPerSourceSelectImagesCli:
+    @pytest.fixture(autouse=True)
+    def _catalog(self, two_source_chip, tmp_path: Path) -> None:  # noqa: ARG002
+        _write_collection(tmp_path)
+
+    def test_clear_selections_only_clears_the_chosen_source(
+        self, two_source_chip, tmp_path: Path
+    ) -> None:
+        chip_dir, _parent = two_source_chip
+        unselected = chip_dir.parent / "chip_002"
+        unselected.mkdir()
+        write_item(create_mock_stac_item("chip_002", bbox=BBOX), unselected / "chip_002.json")
+        args = ["select-images", str(tmp_path), "--clear-selections", "--source", "planetscope"]
+
+        cleared = CliRunner().invoke(cli, args, input="y\n")
+        again = CliRunner().invoke(cli, args, input="y\n")
+
+        assert cleared.exit_code == 0, cleared.output
+        assert "STAC items deleted: 2" in cleared.output
+        assert not (chip_dir / "chip_001_planting_planet.json").exists()
+        assert (chip_dir / "chip_001_planting_s2.json").exists()
+        assert "No chips have planetscope imagery selections to clear." in again.output
+
+    def test_chips_already_selected_for_the_source_are_skipped(self, tmp_path: Path) -> None:
+        result = CliRunner().invoke(
+            cli, ["select-images", str(tmp_path), "--year", "2023", "--source", "planetscope"]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "No chips need processing" in result.output

@@ -320,10 +320,7 @@ def clear_chip_selections(item: pystac.Item, source: str | None = None) -> Clear
     if DEFAULT_SOURCE in sources:
         _clear_default_source(item, chip_dir)
 
-    parent_path = chip_dir / f"{item.id}.json"
-    if item.get_self_href() is None:
-        item.set_self_href(str(parent_path))
-    write_item(item, parent_path)
+    write_item(item, chip_dir / f"{item.id}.json")
 
     return result
 

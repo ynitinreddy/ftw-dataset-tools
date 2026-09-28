@@ -717,6 +717,15 @@ class TestImagerySourceConfig:
                 {"fields_file": "f.parquet", "stages": {"select_images": {key: value}}}
             )
 
+    def test_non_bool_record_candidates_raises(self) -> None:
+        with pytest.raises(ConfigError, match="record_candidates must be true or false"):
+            DatasetConfig.from_dict(
+                {
+                    "fields_file": "f.parquet",
+                    "stages": {"select_images": {"record_candidates": "yes"}},
+                }
+            )
+
     def test_preview_mode_needs_the_default_source(self) -> None:
         with pytest.raises(ConfigError, match="preview"):
             DatasetConfig.from_dict(
