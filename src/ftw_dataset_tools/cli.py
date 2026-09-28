@@ -1,25 +1,43 @@
 """Main CLI entry point for FTW Dataset Tools."""
 
+import importlib
+
 import click
 
 from ftw_dataset_tools import __version__
-from ftw_dataset_tools.commands.add_field_stats import add_field_stats
-from ftw_dataset_tools.commands.convert_previews import convert_previews
-from ftw_dataset_tools.commands.create_boundaries import create_boundaries
-from ftw_dataset_tools.commands.create_chips import create_chips
-from ftw_dataset_tools.commands.create_dataset import create_dataset
-from ftw_dataset_tools.commands.create_dataset_summary import create_dataset_summary
-from ftw_dataset_tools.commands.create_ftw_grid import create_ftw_grid
-from ftw_dataset_tools.commands.create_masks import create_masks
-from ftw_dataset_tools.commands.create_splits import create_splits
-from ftw_dataset_tools.commands.download_images import download_images
-from ftw_dataset_tools.commands.get_grid import get_grid
-from ftw_dataset_tools.commands.inspect_fields import inspect_fields
-from ftw_dataset_tools.commands.run import run
-from ftw_dataset_tools.commands.select_images import select_images
+
+# Command modules are imported on first use to keep startup fast.
+COMMAND_MODULES = (
+    "add_field_stats",
+    "convert_previews",
+    "create_boundaries",
+    "create_chips",
+    "create_dataset",
+    "create_dataset_summary",
+    "create_ftw_grid",
+    "create_masks",
+    "create_splits",
+    "download_images",
+    "get_grid",
+    "inspect_fields",
+    "run",
+    "select_images",
+)
+_COMMANDS = {module.replace("_", "-"): module for module in COMMAND_MODULES}
 
 
-@click.group()
+class LazyGroup(click.Group):
+    def list_commands(self, ctx: click.Context) -> list[str]:
+        return sorted({*super().list_commands(ctx), *_COMMANDS})
+
+    def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
+        module = _COMMANDS.get(cmd_name)
+        if module is None:
+            return super().get_command(ctx, cmd_name)
+        return getattr(importlib.import_module(f"ftw_dataset_tools.commands.{module}"), module)
+
+
+@click.group(cls=LazyGroup)
 @click.version_option(version=__version__, prog_name="ftwd")
 def cli() -> None:
     """FTW Dataset Tools - CLI for creating Fields of the World benchmark dataset.
@@ -32,23 +50,6 @@ def cli() -> None:
     - Creating chip definitions with field coverage statistics
     - Creating boundary lines and raster masks
     """
-
-
-# Register commands
-cli.add_command(add_field_stats)
-cli.add_command(convert_previews)
-cli.add_command(create_boundaries)
-cli.add_command(create_chips)
-cli.add_command(create_dataset)
-cli.add_command(create_dataset_summary)
-cli.add_command(create_ftw_grid)
-cli.add_command(create_masks)
-cli.add_command(create_splits)
-cli.add_command(download_images)
-cli.add_command(get_grid)
-cli.add_command(inspect_fields)
-cli.add_command(run)
-cli.add_command(select_images)
 
 
 if __name__ == "__main__":
