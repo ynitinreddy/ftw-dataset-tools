@@ -296,6 +296,8 @@ class MasksConfig:
     class_filter: str | None = None
     # When true, cells whose mask file already exists (non-empty) are not recreated.
     skip_existing: bool = False
+    # Source crop column for instance labels.
+    crop_column: str | None = None
 
 
 @dataclass
@@ -578,6 +580,7 @@ class DatasetConfig:
         presence_only: bool,
         drop_border_chips: bool,
         border_gap_chips: int = DEFAULT_BORDER_GAP_CHIPS,
+        crop_column: str | None = None,
     ) -> DatasetConfig:
         """Build a config from ``create_dataset`` keyword arguments.
 
@@ -605,6 +608,7 @@ class DatasetConfig:
                     resolution=resolution,
                     workers=num_workers,
                     presence_only=presence_only,
+                    crop_column=crop_column,
                 ),
                 select_images=SelectImagesConfig(enabled=False),
                 download_images=DownloadImagesConfig(enabled=False),
@@ -617,6 +621,15 @@ class DatasetConfig:
 
     def validate(self) -> None:
         """Validate values, raising ConfigError on the first problem found."""
+        crop_column = self.stages.masks.crop_column
+        if crop_column is not None and (
+            not isinstance(crop_column, str)
+            or not crop_column.strip()
+            or "instance" not in self.stages.masks.mask_types
+        ):
+            raise ConfigError(
+                "stages.masks.crop_column requires a column name and mask_types: [instance]"
+            )
         # HTTPS only: the recorded checksum should attest to bytes that could not
         # have been swapped in transit, and the intended sources are all HTTPS.
         if self.fields_file.startswith("http://"):

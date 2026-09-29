@@ -213,6 +213,7 @@ from ftw_dataset_tools.api.stac import detect_datetime_column, get_year_from_dat
     default=False,
     help="Add file:checksum (multihash sha256) to every STAC asset. Slow on large datasets.",
 )
+@click.option("--crop-column", help="Source crop column to save alongside instance masks.")
 def create_dataset_cmd(
     fields_file: str,
     output_dir: str | None,
@@ -236,6 +237,7 @@ def create_dataset_cmd(
     force_image_selection: bool,
     mask_types: str,
     presence_only: bool,
+    crop_column: str | None,
     drop_border_chips: bool,
     border_gap_chips: int,
     class_filter: str | None,
@@ -439,6 +441,7 @@ def create_dataset_cmd(
             year=year,
             mask_types=mask_types_list,
             presence_only=presence_only,
+            crop_column=crop_column,
             drop_border_chips=drop_border_chips,
             border_gap_chips=border_gap_chips,
             class_filter=class_filter,
