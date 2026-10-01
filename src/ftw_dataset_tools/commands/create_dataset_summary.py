@@ -7,6 +7,7 @@ from pathlib import Path
 import click
 
 from ftw_dataset_tools.api import dataset_summary
+from ftw_dataset_tools.commands.cli_logging import is_verbose
 
 
 @click.command("create-dataset-summary")
@@ -26,17 +27,10 @@ from ftw_dataset_tools.api import dataset_summary
     show_default=True,
     help="Number of example chips to include in the report.",
 )
-@click.option(
-    "-v",
-    "--verbose",
-    is_flag=True,
-    help="Enable verbose output.",
-)
 def create_dataset_summary_cmd(
     dataset_dir: str,
     output_path: str | None,
     num_examples: int,
-    verbose: bool,
 ) -> None:
     """Create a summary report for a dataset.
 
@@ -60,13 +54,9 @@ def create_dataset_summary_cmd(
     Examples:
         ftwd create-dataset-summary ~/data/my-dataset
         ftwd create-dataset-summary ~/data/my-dataset -o report.md
-        ftwd create-dataset-summary ~/data/my-dataset --num-examples 20 -v
+        ftwd -v create-dataset-summary ~/data/my-dataset --num-examples 20
     """
     dataset_dir_path = Path(dataset_dir)
-
-    def on_progress(msg: str) -> None:
-        if verbose:
-            click.echo(msg)
 
     try:
         click.echo(f"Creating summary for: {dataset_dir_path.name}")
@@ -75,7 +65,6 @@ def create_dataset_summary_cmd(
             dataset_dir=dataset_dir_path,
             output_path=output_path,
             num_examples=num_examples,
-            on_progress=on_progress,
         )
 
         # Print summary
@@ -116,7 +105,7 @@ def create_dataset_summary_cmd(
         raise SystemExit(1) from e
     except Exception as e:
         click.echo(click.style(f"\nUnexpected error: {e}", fg="red"))
-        if verbose:
+        if is_verbose():
             raise
         raise SystemExit(1) from e
 

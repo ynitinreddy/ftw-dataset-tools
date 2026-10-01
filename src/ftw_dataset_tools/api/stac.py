@@ -35,6 +35,7 @@ from ftw_dataset_tools.api.assets import (
     add_table_columns,
 )
 from ftw_dataset_tools.api.geo import detect_geometry_column, ensure_spatial_loaded, sql_path
+from ftw_dataset_tools.api.logging_config import get_logger, success
 from ftw_dataset_tools.api.masks import MaskType, get_mgrs_square
 from ftw_dataset_tools.api.renders import (
     RENDER_ORDER_PROP,
@@ -45,9 +46,9 @@ from ftw_dataset_tools.api.renders import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
     from ftw_dataset_tools.api.config import DatasetConfig, MetadataConfig
+
+logger = get_logger(__name__)
 
 # Media types
 MEDIA_TYPE_PARQUET = "application/vnd.apache.parquet"
@@ -748,7 +749,6 @@ def generate_stac_catalog(
     year: int | None = None,
     provenance: dict | None = None,
     config: DatasetConfig | None = None,
-    on_progress: Callable[[str], None] | None = None,
     checksums: bool = False,
     background_class_value: int = 0,
 ) -> STACGenerationResult:
@@ -779,7 +779,6 @@ def generate_stac_catalog(
                     the ``ftw:config`` extra field for reproducibility.
         config: Resolved dataset config; supplies metadata and the ftw: build properties
             written on the collection.
-        on_progress: Optional callback for progress messages
         checksums: Compute file:checksum (multihash sha256) for every asset. Slow; default False.
         background_class_value: Pixel value used for background in masks (3 for presence-only).
 
@@ -796,19 +795,15 @@ def generate_stac_catalog(
     chips_base_dir = chips_base_dir_for(output_dir)
     filtered_fields_file = Path(filtered_fields_file) if filtered_fields_file else None
 
-    def log(msg: str) -> None:
-        if on_progress:
-            on_progress(msg)
-
     # Determine temporal extent
-    log("Determining temporal extent...")
+    logger.info("Determining temporal extent...")
     datetime_col = detect_datetime_column(fields_file)
 
     if datetime_col:
-        log(f"Using '{datetime_col}' column for temporal extent")
+        logger.info(f"Using '{datetime_col}' column for temporal extent")
         temporal_extent = get_temporal_extent_from_data(fields_file, datetime_col)
     elif year is not None:
-        log(f"Using year {year} for temporal extent")
+        logger.info(f"Using year {year} for temporal extent")
         temporal_extent = get_temporal_extent_from_year(year)
     else:
         raise ValueError(
@@ -817,24 +812,24 @@ def generate_stac_catalog(
         )
 
     # Get spatial extent from fields
-    log("Calculating spatial extent...")
+    logger.info("Calculating spatial extent...")
     spatial_extent = _get_dataset_bounds(
         fields_file, detect_geometry_column(fields_file) or "geometry"
     )
 
     # Extract chip info (pass year for year-based naming). The geometry column is
     # detected rather than assumed, matching how the masks were rasterized.
-    log("Extracting chip information...")
+    logger.info("Extracting chip information...")
     chip_infos = _extract_chips_info(
         chips_file,
         grid_id_col=grid_id_col,
         geom_col=detect_geometry_column(chips_file) or "geometry",
         year=year,
     )
-    log(f"Found {len(chip_infos)} chips")
+    logger.info(f"Found {len(chip_infos)} chips")
 
     # Create items for each chip, nested by MGRS square
-    log("Creating STAC items...")
+    logger.info("Creating STAC items...")
     # Imported here to avoid a circular import: api.imagery imports back into
     # this module.
     from ftw_dataset_tools.api.imagery.catalog_ops import preserve_imagery_selection
@@ -868,15 +863,17 @@ def generate_stac_catalog(
             items.append(item)
             item_squares[item.id] = square
 
-    log(f"Created {len(items)} items with mask assets")
+    logger.info(f"Created {len(items)} items with mask assets")
     if resumed:
-        log(f"Preserved existing imagery selections for {resumed} items")
+        logger.info(f"Preserved existing imagery selections for {resumed} items")
 
     # Create the single collection
-    log("Creating collection...")
+    logger.info("Creating collection...")
     metadata = config.metadata if config is not None else None
     if metadata is None or not metadata.license:
-        log("Warning: no metadata.license; the collection is not Portolan-publishable without one")
+        logger.warning(
+            "no metadata.license; the collection is not Portolan-publishable without one"
+        )
 
     collection = _create_collection(
         dataset_name=field_dataset,
@@ -934,7 +931,7 @@ def generate_stac_catalog(
 
     # normalize_hrefs assigns each item's self href in-memory (needed for rustac to
     # serialize them below) without writing any files yet.
-    log("Writing STAC catalog...")
+    logger.info("Writing STAC catalog...")
     collection.normalize_hrefs(str(output_dir), strategy=CHIP_LAYOUT)
     # Set the catalog type before serializing the items below: item.to_dict()
     # renders hierarchical link hrefs relative only when the root catalog is a
@@ -947,7 +944,7 @@ def generate_stac_catalog(
     # would otherwise write an absolute filesystem self link into that file.
     items_parquet_path: Path | None = None
     if items:
-        log("Writing stac-geoparquet...")
+        logger.info("Writing stac-geoparquet...")
         items_parquet_path = output_dir / "items.parquet"
         _write_items_parquet(items, items_parquet_path)
         _add_parquet_asset(
@@ -961,7 +958,7 @@ def generate_stac_catalog(
 
     collection.save(catalog_type=collection.catalog_type)
 
-    log("STAC catalog generation complete")
+    success(logger, "STAC catalog generation complete")
 
     return STACGenerationResult(
         collection_path=output_dir / "collection.json",

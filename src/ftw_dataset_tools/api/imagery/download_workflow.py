@@ -25,8 +25,10 @@ from ftw_dataset_tools.api.imagery.parallel import (
 )
 from ftw_dataset_tools.api.imagery.scene_selection import SelectedScene
 from ftw_dataset_tools.api.imagery.thumbnails import has_rgb_bands
+from ftw_dataset_tools.api.logging_config import capture_logs, replay
 
 if TYPE_CHECKING:
+    import logging
     from collections.abc import Callable
     from pathlib import Path
 
@@ -196,7 +198,7 @@ def download_imagery_for_catalog(
 class DownloadTask:
     """One scene to fetch, with the paths its outputs go to.
 
-    ``logs`` collects the download's progress lines so the caller can replay them
+    ``logs`` collects the download's log records so the caller can replay them
     in one block rather than have concurrent downloads interleave their output.
     """
 
@@ -207,7 +209,7 @@ class DownloadTask:
     base_id: str
     output_filename: str
     output_path: Path
-    logs: list[str] = field(default_factory=list)
+    logs: list[logging.LogRecord] = field(default_factory=list)
 
 
 def skip_download_reason(item: pystac.Item, item_path: Path, *, resume: bool) -> str | None:
@@ -251,7 +253,7 @@ def download_task_scene(
     """Fetch and clip one scene.
 
     Safe to run on a worker thread: it writes only this task's own GeoTIFF and
-    collects its log lines instead of printing them.
+    collects its log records instead of emitting them.
     """
     scene = SelectedScene(
         item=task.item,
@@ -261,14 +263,14 @@ def download_task_scene(
         stac_url=task.item.get_self_href() or "",
     )
 
-    return download_and_clip_scene(
-        scene=scene,
-        bbox=task.bbox,
-        output_path=task.output_path,
-        bands=bands,
-        resolution=resolution,
-        on_progress=task.logs.append,
-    )
+    with capture_logs(task.logs):
+        return download_and_clip_scene(
+            scene=scene,
+            bbox=task.bbox,
+            output_path=task.output_path,
+            bands=bands,
+            resolution=resolution,
+        )
 
 
 def _record_download(
@@ -284,6 +286,7 @@ def _record_download(
     so this must never run concurrently with itself.
     """
     task = outcome.task
+    replay(task.logs)
 
     if outcome.error is not None:
         result.failed += 1

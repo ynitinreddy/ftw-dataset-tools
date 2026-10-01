@@ -30,8 +30,10 @@ from ftw_dataset_tools.api.imagery.parallel import (
 from ftw_dataset_tools.api.imagery.progress import ImageryProgressBar
 from ftw_dataset_tools.api.imagery.scene_selection import select_scenes_for_chip
 from ftw_dataset_tools.api.imagery.stac_child_items import create_child_items_from_selection
+from ftw_dataset_tools.api.logging_config import capture_logs
 
 if TYPE_CHECKING:
+    import logging
     from pathlib import Path
 
     from ftw_dataset_tools.api.imagery.scene_selection import SceneSelectionResult
@@ -49,15 +51,15 @@ __all__ = [
 class ChipSelectionJob:
     """One chip's selection work: its item, where it lives, and the year to select for.
 
-    ``logs`` collects the progress lines the selection produced so the caller can
-    replay them in one block; printing them from the worker would interleave the
+    ``logs`` collects the log records the selection produced so the caller can
+    replay them in one block; emitting them from the worker would interleave the
     chips running alongside it.
     """
 
     item: pystac.Item
     item_path: Path
     year: int
-    logs: list[str] = field(default_factory=list)
+    logs: list[logging.LogRecord] = field(default_factory=list)
 
 
 def run_chip_selection(
@@ -75,30 +77,30 @@ def run_chip_selection(
     Safe to run on a worker thread: every chip queries the scene catalog on its
     own and writes only into its own directory.
     """
-    selection = select_scenes_for_chip(
-        chip_id=job.item.id,
-        bbox=tuple(job.item.bbox),
-        year=job.year,
-        cloud_cover_chip=cloud_cover_chip,
-        nodata_max=nodata_max,
-        buffer_days=buffer_days,
-        num_buffer_expansions=num_buffer_expansions,
-        buffer_expansion_size=buffer_expansion_size,
-        search_backend=search_backend,
-        on_progress=job.logs.append,
-    )
-
-    if selection.success:
-        create_child_items_from_selection(
-            chip_dir=job.item_path.parent,
-            parent_item=job.item,
-            result=selection,
+    with capture_logs(job.logs):
+        selection = select_scenes_for_chip(
+            chip_id=job.item.id,
+            bbox=tuple(job.item.bbox),
             year=job.year,
             cloud_cover_chip=cloud_cover_chip,
+            nodata_max=nodata_max,
             buffer_days=buffer_days,
             num_buffer_expansions=num_buffer_expansions,
             buffer_expansion_size=buffer_expansion_size,
+            search_backend=search_backend,
         )
+
+        if selection.success:
+            create_child_items_from_selection(
+                chip_dir=job.item_path.parent,
+                parent_item=job.item,
+                result=selection,
+                year=job.year,
+                cloud_cover_chip=cloud_cover_chip,
+                buffer_days=buffer_days,
+                num_buffer_expansions=num_buffer_expansions,
+                buffer_expansion_size=buffer_expansion_size,
+            )
 
     return selection
 
@@ -164,7 +166,6 @@ def select_imagery_for_catalog(
     buffer_expansion_size: int = 14,
     force: bool = False,
     on_missing: Literal["skip", "fail"] = "skip",
-    verbose: bool = False,
     workers: int = DEFAULT_WORKERS,
     search_backend: str = "parquet",
 ) -> SelectionWorkflowResult:
@@ -185,7 +186,6 @@ def select_imagery_for_catalog(
         on_missing: How to handle chips with no cloud-free scenes:
                     - "skip": Skip and record in skipped_details
                     - "fail": Raise exception
-        verbose: If True, show detailed STAC query information
         workers: Number of chips to select for concurrently
         search_backend: "parquet" (the STAC-GeoParquet mirror, default) or
                         "earth-search" (the Earth Search STAC API)
@@ -246,7 +246,6 @@ def select_imagery_for_catalog(
         num_buffer_expansions=num_buffer_expansions,
         buffer_expansion_size=buffer_expansion_size,
         on_missing=on_missing,
-        verbose=verbose,
         workers=workers,
         search_backend=search_backend,
     )
@@ -265,7 +264,6 @@ def _run_selection(
     num_buffer_expansions: int,
     buffer_expansion_size: int,
     on_missing: Literal["skip", "fail"],
-    verbose: bool,
     workers: int,
     search_backend: str = "parquet",
 ) -> None:
@@ -292,7 +290,7 @@ def _run_selection(
             search_backend=search_backend,
         )
 
-    with ImageryProgressBar(total=len(jobs), leave=False, verbose=verbose) as progress:
+    with ImageryProgressBar(total=len(jobs), leave=False) as progress:
 
         def apply(outcome: ParallelOutcome[ChipSelectionJob, SceneSelectionResult]) -> None:
             _record_chip(outcome, result=result, progress=progress, on_missing=on_missing)
@@ -314,8 +312,7 @@ def _record_chip(
     """Fold one chip's outcome into the counters and the progress bar (calling thread only)."""
     job = outcome.task
     progress.start_chip(job.item.id)
-    for message in job.logs:
-        progress.on_progress(message)
+    progress.show(job.logs)
 
     if outcome.error is not None:
         if on_missing == "fail":

@@ -92,7 +92,6 @@ def create_splits(
             split_percents=validated_split_percents,
             random_seed=random_seed,
             fields_file=fields_file,
-            on_progress=lambda msg: click.echo(msg),
         )
 
         click.echo()

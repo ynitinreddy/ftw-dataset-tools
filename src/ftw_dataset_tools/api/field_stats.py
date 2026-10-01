@@ -25,11 +25,12 @@ from ftw_dataset_tools.api.geo import (
     sql_path,
     write_geoparquet,
 )
+from ftw_dataset_tools.api.logging_config import get_logger
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
     from ftw_dataset_tools.api.geo import CRSInfo
+
+logger = get_logger(__name__)
 
 # Default FTW grid source on Source Cooperative
 DEFAULT_FTW_GRID_SOURCE = (
@@ -237,7 +238,6 @@ def _compute_coverage_in_batches(
     fields_bbox_col: str | None,
     coverage_col: str,
     batch_size: int,
-    log: Callable[[str], None],
 ) -> None:
     """Fill ``result`` with every grid cell and its coverage, ``batch_size`` cells at a time."""
     batches = _rowid_batches(conn, batch_size)
@@ -252,12 +252,12 @@ def _compute_coverage_in_batches(
             )
         )
         done += count
-        log(f"  Coverage: {done:,}/{total:,} grid cells")
+        logger.info(f"  Coverage: {done:,}/{total:,} grid cells")
     conn.execute(f"CREATE TABLE result AS {_build_result_query(grid_geom_col, coverage_col)}")
     conn.execute("DROP TABLE coverage")
 
 
-def _chip_order_by(conn: duckdb.DuckDBPyConnection, log: Callable[[str], None]) -> str:
+def _chip_order_by(conn: duckdb.DuckDBPyConnection) -> str:
     """ORDER BY clause pinning the written row order to the chip id.
 
     ``assign_splits`` maps a shuffled label array onto the chip rows by position,
@@ -273,8 +273,8 @@ def _chip_order_by(conn: duckdb.DuckDBPyConnection, log: Callable[[str], None]) 
     columns = [row[0] for row in conn.execute("DESCRIBE result").fetchall()]
     if CHIP_ID_COLUMN in columns:
         return f' ORDER BY "{CHIP_ID_COLUMN}"'
-    log(
-        f"Warning: grid has no '{CHIP_ID_COLUMN}' column, so output row order "
+    logger.warning(
+        f"grid has no '{CHIP_ID_COLUMN}' column, so output row order "
         f"follows the grid file's own order"
     )
     return ""
@@ -352,7 +352,6 @@ def _drop_undersized_chips(
     min_chip_area: float,
     km_size: float,
     is_geographic: bool,
-    log: Callable[[str], None],
 ) -> int:
     """
     Remove grid cells truncated below min_chip_area percent of a full cell.
@@ -373,8 +372,8 @@ def _drop_undersized_chips(
         f"SELECT COUNT(*) FROM grid_table WHERE NOT ({measurable})"
     ).fetchone()[0]
     if unmeasurable:
-        log(
-            f"Warning: could not measure the area of {unmeasurable:,} grid cells, so those "
+        logger.warning(
+            f"could not measure the area of {unmeasurable:,} grid cells, so those "
             "cells were kept unchecked. This usually means the grid's CRS metadata does "
             "not match its coordinates."
         )
@@ -385,16 +384,18 @@ def _drop_undersized_chips(
     removed = before_count - after_count
 
     if removed == 0:
-        log(f"No undersized chips found (all cells at least {min_chip_area}% of {km_size}km)")
+        logger.info(
+            f"No undersized chips found (all cells at least {min_chip_area}% of {km_size}km)"
+        )
         return 0
 
-    log(
+    logger.info(
         f"Removed {removed:,} undersized chips (below {min_chip_area}% of a "
         f"{km_size}x{km_size}km cell), {after_count:,} chips remaining"
     )
     if before_count and removed > before_count / 2:
-        log(
-            f"Warning: the size filter removed {100 * removed / before_count:.1f}% of cells. "
+        logger.warning(
+            f"the size filter removed {100 * removed / before_count:.1f}% of cells. "
             f"Check that the grid really is {km_size}km; pass km_size to match a custom grid."
         )
     return removed
@@ -416,7 +417,6 @@ def add_field_stats(
     drop_border_chips: bool = False,
     border_gap_chips: int = DEFAULT_BORDER_GAP_CHIPS,
     grid_source: str = DEFAULT_FTW_GRID_SOURCE,
-    on_progress: Callable[[str], None] | None = None,
     batch_size: int = DEFAULT_COVERAGE_BATCH_SIZE,
 ) -> FieldStatsResult:
     """
@@ -454,7 +454,6 @@ def add_field_stats(
             as a cluster edge
         grid_source: URL/path to fetch grid from when grid_file is None
             (default: FTW grid on Source Coop)
-        on_progress: Optional callback for progress messages
         batch_size: Grid cells per coverage batch; the per-cell intersection
             union is materialised one batch at a time to bound memory.
 
@@ -481,14 +480,10 @@ def add_field_stats(
         if not grid_path.exists():
             raise FileNotFoundError(f"Grid file not found: {grid_path}")
 
-    def log(msg: str) -> None:
-        if on_progress:
-            on_progress(msg)
-
     # Auto-detect fields geometry column from GeoParquet metadata
     if fields_geom_col is None:
         fields_geom_col = detect_geometry_column(fields_path) or "geometry"
-        log(f"Detected fields geometry column: {fields_geom_col}")
+        logger.info(f"Detected fields geometry column: {fields_geom_col}")
 
     # Track temp files for cleanup
     temp_files: list[Path] = []
@@ -499,44 +494,44 @@ def add_field_stats(
         ensure_spatial_loaded(conn)
 
         # Load fields table first (needed for bounds calculation if fetching grid from S3)
-        log("Loading fields data...")
+        logger.info("Loading fields data...")
         conn.execute(f"CREATE TABLE fields_table AS SELECT * FROM '{sql_path(fields_path)}'")
         fields_count = conn.execute("SELECT COUNT(*) FROM fields_table").fetchone()[0]
-        log(f"Loaded {fields_count:,} field polygons")
+        logger.info(f"Loaded {fields_count:,} field polygons")
 
         # Handle grid loading - either from local file or S3
         if grid_path is not None:
             # Local grid file provided
             if grid_geom_col is None:
                 grid_geom_col = detect_geometry_column(grid_path) or "geometry"
-                log(f"Detected grid geometry column: {grid_geom_col}")
+                logger.info(f"Detected grid geometry column: {grid_geom_col}")
 
             # Check CRS compatibility
             grid_crs = detect_crs(grid_path, grid_geom_col)
             fields_crs = detect_crs(fields_path, fields_geom_col)
 
-            log(f"Grid CRS: {grid_crs}")
-            log(f"Fields CRS: {fields_crs}")
+            logger.info(f"Grid CRS: {grid_crs}")
+            logger.info(f"Fields CRS: {fields_crs}")
 
             if not grid_crs.is_equivalent_to(fields_crs):
                 if reproject_to_4326:
-                    log("CRS mismatch detected, reprojecting to EPSG:4326...")
+                    logger.info("CRS mismatch detected, reprojecting to EPSG:4326...")
 
                     # Reproject grid if needed
                     if grid_crs.authority_code != "EPSG:4326":
                         grid_temp = Path(tempfile.mktemp(suffix=".parquet"))
                         temp_files.append(grid_temp)
-                        reproject(grid_path, grid_temp, "EPSG:4326", on_progress)
+                        reproject(grid_path, grid_temp, "EPSG:4326")
                         grid_path = grid_temp
-                        log(f"Reprojected grid to: {grid_temp}")
+                        logger.info(f"Reprojected grid to: {grid_temp}")
 
                     # Reproject fields if needed - need to reload fields table
                     if fields_crs.authority_code != "EPSG:4326":
                         fields_temp = Path(tempfile.mktemp(suffix=".parquet"))
                         temp_files.append(fields_temp)
-                        reproject(fields_path, fields_temp, "EPSG:4326", on_progress)
+                        reproject(fields_path, fields_temp, "EPSG:4326")
                         fields_path = fields_temp
-                        log(f"Reprojected fields to: {fields_temp}")
+                        logger.info(f"Reprojected fields to: {fields_temp}")
                         # Reload fields table with reprojected data
                         conn.execute("DROP TABLE fields_table")
                         conn.execute(
@@ -550,7 +545,7 @@ def add_field_stats(
                         file2=str(fields_file),
                     )
 
-            log("Loading grid data...")
+            logger.info("Loading grid data...")
             conn.execute(f"CREATE TABLE grid_table AS SELECT * FROM '{sql_path(grid_path)}'")
         else:
             # Fetch grid from S3 based on fields bounds
@@ -567,7 +562,7 @@ def add_field_stats(
                     f"  ftwd reproject {fields_file} --target-crs EPSG:4326"
                 )
 
-            log("Fetching grid from Source Coop...")
+            logger.info("Fetching grid from Source Coop...")
 
             # Compute bounds from fields geometry
             bounds_result = conn.execute(f"""
@@ -579,16 +574,16 @@ def add_field_stats(
                 FROM fields_table
             """).fetchone()
             xmin, ymin, xmax, ymax = bounds_result
-            log(f"Fields bounds: [{xmin:.6f}, {ymin:.6f}, {xmax:.6f}, {ymax:.6f}]")
-            log(
+            logger.info(f"Fields bounds: [{xmin:.6f}, {ymin:.6f}, {xmax:.6f}, {ymax:.6f}]")
+            logger.info(
                 "BBox Finder URL: "
                 f"https://bboxfinder.com/#{ymin:.6f},{xmin:.6f},{ymax:.6f},{xmax:.6f}"
             )
 
             # Guard against mislabeled CRS (EPSG:4326 expected degrees)
             if abs(xmin) > 180 or abs(xmax) > 180 or abs(ymin) > 90 or abs(ymax) > 90:
-                log(
-                    "Warning: Fields bounds are outside degree ranges for EPSG:4326. "
+                logger.warning(
+                    "Fields bounds are outside degree ranges for EPSG:4326. "
                     "This suggests the file CRS metadata may be incorrect."
                 )
                 raise ValueError(
@@ -601,7 +596,7 @@ def add_field_stats(
             configure_source_coop_s3(conn)
 
             # Fetch grid cells that intersect the bounding box
-            log("Fetching grid cells by bounding box...")
+            logger.info("Fetching grid cells by bounding box...")
             conn.execute(f"""
                 CREATE TABLE grid_table AS
                 SELECT *
@@ -615,11 +610,11 @@ def add_field_stats(
             # Auto-detect grid geometry column from the fetched data
             if grid_geom_col is None:
                 grid_geom_col = "geometry"
-                log(f"Using grid geometry column: {grid_geom_col}")
+                logger.info(f"Using grid geometry column: {grid_geom_col}")
 
         # Get grid count
         grid_count = conn.execute("SELECT COUNT(*) FROM grid_table").fetchone()[0]
-        log(f"Loaded {grid_count:,} grid cells")
+        logger.info(f"Loaded {grid_count:,} grid cells")
 
         # Drop chips the MGRS grid truncated at a zone or band boundary. Done before
         # the coverage pass so no work is spent on cells that are about to go.
@@ -633,7 +628,6 @@ def add_field_stats(
                 min_chip_area=min_chip_area,
                 km_size=km_size,
                 is_geographic=_grid_uses_degrees(conn, grid_path, grid_geom_col),
-                log=log,
             )
             grid_count -= cells_dropped_undersized
 
@@ -648,27 +642,27 @@ def add_field_stats(
                 # For S3 source, we know the bbox column is "bbox"
                 detected_grid_bbox = "bbox"
             if detected_grid_bbox:
-                log(f"Detected grid bbox column: {detected_grid_bbox}")
+                logger.info(f"Detected grid bbox column: {detected_grid_bbox}")
             else:
-                log("Warning: grid has no bbox column, spatial queries may be slower")
+                logger.warning("grid has no bbox column, spatial queries may be slower")
 
         if detected_fields_bbox is None:
             detected_fields_bbox = detect_bbox_column(conn, str(fields_path), fields_geom_col)
             if detected_fields_bbox:
-                log(f"Detected fields bbox column: {detected_fields_bbox}")
+                logger.info(f"Detected fields bbox column: {detected_fields_bbox}")
             else:
-                log(
-                    f"Warning: {fields_path.name} has no bbox column, spatial queries may be slower"
+                logger.warning(
+                    f"{fields_path.name} has no bbox column, spatial queries may be slower"
                 )
 
         # Report optimization status
         if detected_grid_bbox and detected_fields_bbox:
-            log("Using bbox optimization for spatial joins")
+            logger.info("Using bbox optimization for spatial joins")
         else:
-            log("Bbox optimization disabled (missing bbox columns)")
+            logger.info("Bbox optimization disabled (missing bbox columns)")
 
         # Build and execute coverage query
-        log("Calculating coverage...")
+        logger.info("Calculating coverage...")
         _compute_coverage_in_batches(
             conn,
             grid_geom_col=grid_geom_col,
@@ -677,7 +671,6 @@ def add_field_stats(
             fields_bbox_col=detected_fields_bbox,
             coverage_col=coverage_col,
             batch_size=batch_size,
-            log=log,
         )
 
         # Filter by min_coverage if specified
@@ -688,12 +681,12 @@ def add_field_stats(
             """)
             after_count = conn.execute("SELECT COUNT(*) FROM result").fetchone()[0]
             removed = before_count - after_count
-            log(f"Filtered out {removed:,} cells with coverage < {min_coverage}%")
+            logger.info(f"Filtered out {removed:,} cells with coverage < {min_coverage}%")
 
         # Border chips are dropped here, after coverage is known: the labelled region is
         # estimated from the chips that actually hold fields.
         if drop_border_chips:
-            log("Identifying border chips to remove...")
+            logger.info("Identifying border chips to remove...")
             borders = find_border_chips(
                 conn,
                 "result",
@@ -709,12 +702,12 @@ def add_field_stats(
                     [borders.border_rowids],
                 )
                 remaining = conn.execute("SELECT COUNT(*) FROM result").fetchone()[0]
-                log(
+                logger.info(
                     f"Removed {borders.border_count:,} border chips across "
                     f"{borders.cluster_count:,} cluster(s), {remaining:,} chips remaining"
                 )
             else:
-                log(f"No border chips found across {borders.cluster_count:,} cluster(s)")
+                logger.info(f"No border chips found across {borders.cluster_count:,} cluster(s)")
 
         # Calculate summary statistics
         stats = conn.execute(f"""
@@ -736,10 +729,8 @@ def add_field_stats(
             out_path = fields_path.parent / f"chips_{fields_path.stem}.parquet"
 
         # Write output with proper GeoParquet metadata
-        log(f"Writing output to: {out_path}")
-        write_geoparquet(
-            out_path, conn=conn, query=f"SELECT * FROM result{_chip_order_by(conn, log)}"
-        )
+        logger.info(f"Writing output to: {out_path}")
+        write_geoparquet(out_path, conn=conn, query=f"SELECT * FROM result{_chip_order_by(conn)}")
 
         conn.close()
 

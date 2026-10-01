@@ -98,20 +98,6 @@ def add_field_stats_cmd(
     click.echo(f"Grid file: {grid_file}")
     click.echo(f"Fields file: {fields_file}")
 
-    # Progress callback that prints messages
-    def on_progress(msg: str) -> None:
-        if msg.startswith("Warning:"):
-            click.echo(click.style(msg, fg="yellow"))
-        elif "CRS mismatch" in msg or "reprojecting" in msg.lower():
-            click.echo(click.style(msg, fg="cyan"))
-        elif "optimization" in msg.lower():
-            if "disabled" in msg.lower():
-                click.echo(click.style(msg, fg="yellow"))
-            else:
-                click.echo(click.style(msg, fg="green"))
-        else:
-            click.echo(msg)
-
     try:
         result = field_stats.add_field_stats(
             fields_file=fields_file,
@@ -125,7 +111,6 @@ def add_field_stats_cmd(
             min_coverage=min_coverage,
             reproject_to_4326=reproject_to_4326,
             batch_size=batch_size,
-            on_progress=on_progress,
         )
 
         # Print summary

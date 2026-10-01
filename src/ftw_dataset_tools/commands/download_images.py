@@ -28,6 +28,7 @@ from ftw_dataset_tools.api.imagery.parallel import (
     run_in_parallel,
 )
 from ftw_dataset_tools.api.imagery.thumbnails import has_rgb_bands
+from ftw_dataset_tools.api.logging_config import replay
 from ftw_dataset_tools.api.stac_items import STACSaveError, write_item
 
 if TYPE_CHECKING:
@@ -78,9 +79,7 @@ def _record_download(
     updates below must never run concurrently with each other.
     """
     task = outcome.task
-    for message in task.logs:
-        if message.startswith("Grid:"):
-            tqdm.write(f"  {message}")
+    replay(task.logs)
 
     if outcome.error is not None:
         failed.append({"item": task.item.id, "error": str(outcome.error)})

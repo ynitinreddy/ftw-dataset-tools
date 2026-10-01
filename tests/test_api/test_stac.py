@@ -385,7 +385,6 @@ def build_catalog(
     checksums: bool = False,
     config=None,
     provenance=None,
-    on_progress=None,
     filtered: bool = False,
     with_masks: bool = True,
     grid_id: str = "ftw-33UXP0410",
@@ -442,7 +441,6 @@ def build_catalog(
         checksums=checksums,
         config=config,
         provenance=provenance,
-        on_progress=on_progress,
         background_class_value=background_class_value,
     )
 
@@ -747,11 +745,13 @@ class TestCollectionMetadata:
         coll = json.loads(result.collection_path.read_text())
         assert "ftw:split_type" not in coll
 
-    def test_warns_without_license(self, tmp_path: Path) -> None:
-        messages: list[str] = []
-        build_catalog(tmp_path, on_progress=messages.append)
+    def test_warns_without_license(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        build_catalog(tmp_path)
 
-        assert any("not Portolan-publishable" in m for m in messages)
+        assert any(
+            r.levelname == "WARNING" and "not Portolan-publishable" in r.message
+            for r in caplog.records
+        )
 
     def test_via_link_from_source_via(self, tmp_path: Path) -> None:
         import json

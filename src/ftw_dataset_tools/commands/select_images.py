@@ -86,8 +86,7 @@ def _record_chip(
     job = outcome.task
     chip_id = job.item.id
     progress.start_chip(chip_id)
-    for message in job.logs:
-        progress.on_progress(message)
+    progress.show(job.logs)
 
     if outcome.error is not None:
         if on_missing == "fail":
@@ -196,13 +195,6 @@ def _record_chip(
     help="Path for JSON report of skipped/failed chips.",
 )
 @click.option(
-    "-v",
-    "--verbose",
-    is_flag=True,
-    default=False,
-    help="Show detailed STAC query information and results.",
-)
-@click.option(
     "-o",
     "--output-dir",
     type=click.Path(path_type=Path),
@@ -234,7 +226,6 @@ def select_images_cmd(
     search_backend: Literal["parquet", "earth-search"],
     workers: int | None,
     output_report: str | None,
-    verbose: bool,
     output_dir: Path | None,
     show_stats: bool,
     clear_selections: bool,
@@ -257,7 +248,7 @@ def select_images_cmd(
     \b
     Examples:
         ftwd select-images ./my-dataset
-        ftwd select-images ./my-dataset/chips/33UXP/ftw-34UFF1628_2024/ftw-34UFF1628_2024.json -v
+        ftwd -v select-images ./my-dataset/chips/33UXP/ftw-34UFF1628_2024/ftw-34UFF1628_2024.json
         ftwd select-images ./my-dataset --year 2023 --cloud-cover-chip 5
         ftwd select-images ./my-dataset --force  # Overwrite existing selections
     """
@@ -394,8 +385,6 @@ def select_images_cmd(
     click.echo(
         f"Buffer: {buffer_days} days (expand by {buffer_expansion_size}d x{num_buffer_expansions})"
     )
-    if verbose:
-        click.echo("Verbose mode: ON")
 
     click.echo(f"\nFound {len(chip_items)} total chips")
 
@@ -460,7 +449,7 @@ def select_images_cmd(
 
     # Warm the crop calendar before fanning out: every chip needs it, and the
     # first-time download must not be entered by several workers at once.
-    ensure_crop_calendar_exists(on_progress=lambda msg: click.echo(f"  {msg}"))
+    ensure_crop_calendar_exists()
 
     def work(job: ChipSelectionJob) -> SceneSelectionResult:
         return run_chip_selection(
@@ -473,7 +462,7 @@ def select_images_cmd(
             search_backend=search_backend,
         )
 
-    with ImageryProgressBar(total=len(jobs), leave=True, verbose=verbose) as progress:
+    with ImageryProgressBar(total=len(jobs), leave=True) as progress:
 
         def apply(outcome: ParallelOutcome[ChipSelectionJob, SceneSelectionResult]) -> None:
             _record_chip(
