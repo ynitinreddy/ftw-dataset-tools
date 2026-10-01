@@ -164,6 +164,47 @@ class TestSelectImagesMosaics:
         assert result.exit_code == 1
         assert "has mosaics imagery" in result.output
 
+    def test_on_missing_fail_names_the_chip(self, tmp_path: Path) -> None:
+        skipped = MagicMock(success=False, skipped_reason="No complete mosaic year (tried 2024)")
+        with (
+            patch(_YEAR_AVAILABLE, return_value=True),
+            patch(f"{_SELECT}.run_chip_selection", return_value=skipped),
+        ):
+            result = CliRunner().invoke(
+                cli,
+                [
+                    "select-images",
+                    str(_catalog(tmp_path)),
+                    "--imagery-mode",
+                    "mosaics",
+                    "--year",
+                    "2024",
+                    "--on-missing",
+                    "fail",
+                ],
+            )
+        assert result.exit_code == 1
+        assert "No imagery for chip_001_2024: No complete mosaic year" in result.output
+
+    def test_clear_selections_removes_quarter_items(self, tmp_path: Path) -> None:
+        catalog = _catalog(
+            tmp_path,
+            {"ftw:imagery_mode": "mosaics", "ftw:requested_year": 2024},
+            links=("ftw:q1", "ftw:q2", "ftw:q3", "ftw:q4"),
+        )
+        chip_dir = catalog / "chips" / "32UNA" / "chip_001_2024"
+        for quarter in ("q1", "q2", "q3", "q4"):
+            (chip_dir / f"chip_001_2024_{quarter}_s2.json").write_text("{}")
+
+        result = CliRunner().invoke(
+            cli, ["select-images", str(catalog), "--clear-selections"], input="y\n"
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "The imagery STAC items of 1 chips" in result.output
+        assert "STAC items deleted: 4" in result.output
+        assert not list(chip_dir.glob("*_q*_s2.json"))
+
 
 class TestCreateDatasetMosaics:
     def test_scene_only_option_fails_before_any_work(self, tmp_path: Path) -> None:

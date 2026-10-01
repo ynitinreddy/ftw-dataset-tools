@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import urllib.error
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import duckdb
@@ -20,7 +21,10 @@ from ftw_dataset_tools.api.imagery.catalog_ops import (
     has_existing_scenes,
     selection_conflict,
 )
-from ftw_dataset_tools.api.imagery.download_workflow import build_download_task
+from ftw_dataset_tools.api.imagery.download_workflow import (
+    build_download_task,
+    find_s2_child_items,
+)
 from ftw_dataset_tools.api.imagery.image_download import (
     download_and_clip_scene,
     find_reference_mask_for_output,
@@ -39,6 +43,7 @@ from ftw_dataset_tools.api.imagery.selection_workflow import (
     find_chip_items,
     resolve_selection_conflicts,
     run_chip_selection,
+    select_imagery_for_catalog,
 )
 from ftw_dataset_tools.api.imagery.slots import (
     MOSAIC_SOURCE,
@@ -51,9 +56,6 @@ from ftw_dataset_tools.api.imagery.stac_child_items import (
     attach_existing_seasons,
     create_mosaic_child_items,
 )
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 CHIP_BBOX = (10.0, 50.0, 10.01, 50.01)
 
@@ -498,3 +500,132 @@ def test_exists_sends_a_user_agent() -> None:
     request = urlopen.call_args.args[0]
     assert request.get_method() == "HEAD"
     assert request.get_header("User-agent").startswith("ftw-dataset-tools/")
+
+
+def _http_error(code: int) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError("https://example.com/x", code, "error", None, None)  # type: ignore[arg-type]
+
+
+class TestMosaicSearchEdges:
+    def test_missing_index_is_not_an_error(self) -> None:
+        with patch.object(mosaic_search.urllib.request, "urlopen", side_effect=_http_error(404)):
+            assert not mosaic_search._exists("https://example.com/x.parquet")
+
+    def test_other_http_errors_propagate(self) -> None:
+        # A 403/5xx must not silently mark every year unavailable.
+        with (
+            patch.object(mosaic_search.urllib.request, "urlopen", side_effect=_http_error(403)),
+            pytest.raises(urllib.error.HTTPError),
+        ):
+            mosaic_search._exists("https://example.com/x.parquet")
+
+    def test_year_availability_is_checked_once(self) -> None:
+        with (
+            patch.object(mosaic_search, "_exists", return_value=True) as exists,
+            patch.object(mosaic_search, "_years", {}),
+        ):
+            assert mosaic_search.year_available(2024)
+            assert mosaic_search.year_available(2024)
+        assert exists.call_count == 4
+
+    @pytest.mark.usefixtures("local_index")
+    def test_index_is_read_once_per_quarter(self) -> None:
+        with patch.object(mosaic_search, "_connection", wraps=mosaic_search._connection) as conn:
+            mosaic_search.find_containing_tile(CHIP_BBOX, 2024, 1)
+            mosaic_search.find_containing_tile(CHIP_BBOX, 2024, 1)
+        assert conn.call_count == 1
+
+    @pytest.mark.usefixtures("local_index")
+    def test_tiles_outside_the_chip_latitude_are_skipped(self) -> None:
+        assert mosaic_search.find_containing_tile((10.0, 60.0, 10.01, 60.01), 2024, 1) is None
+
+    def test_antimeridian_tile_overlaps_both_sides(self) -> None:
+        assert mosaic_search._lon_overlaps(178.0, -179.0, 179.5, 179.6)
+        assert mosaic_search._lon_overlaps(178.0, -179.0, -179.6, -179.5)
+        assert not mosaic_search._lon_overlaps(178.0, -179.0, 10.0, 10.1)
+
+
+class TestMosaicSelectionEdges:
+    def test_fallback_stops_when_candidates_run_out(self) -> None:
+        assert fallback_years(2024, lambda year: year == 2024) == [2024]
+
+    def test_progress_lines_are_reported(self) -> None:
+        logs: list[str] = []
+        with (
+            patch(f"{_SELECTION}.year_available", return_value=True),
+            patch(
+                f"{_SELECTION}.find_containing_tile", side_effect=lambda _b, y, n: _tile_item(y, n)
+            ),
+            patch(f"{_SELECTION}.calculate_nodata_percentage", return_value=0.0),
+        ):
+            select_mosaics_for_chip("chip_001", CHIP_BBOX, 2024, on_progress=logs.append)
+        assert logs[-1] == "Selected mosaics for 2024"
+        assert any("2024 Q3" in line for line in logs)
+
+    def test_failed_selection_writes_no_children(self, tmp_path: Path) -> None:
+        parent, path = _chip(tmp_path)
+        job = ChipSelectionJob(item=parent, item_path=path, year=2024)
+        failed = MosaicSelectionResult(
+            chip_id="chip_001", bbox=CHIP_BBOX, requested_year=2024, skipped_reason="none"
+        )
+        with patch(
+            "ftw_dataset_tools.api.imagery.selection_workflow.select_mosaics_for_chip",
+            return_value=failed,
+        ):
+            result = run_chip_selection(
+                job,
+                cloud_cover_chip=2.0,
+                nodata_max=0.0,
+                buffer_days=14,
+                num_buffer_expansions=3,
+                buffer_expansion_size=14,
+                imagery_mode="mosaics",
+            )
+        assert not result.success
+        assert not list(path.parent.glob("*_q*_s2.json"))
+
+    def test_catalog_selection_skips_the_crop_calendar(self, tmp_path: Path) -> None:
+        _chip(tmp_path)
+        with (
+            patch(
+                "ftw_dataset_tools.api.imagery.selection_workflow.select_mosaics_for_chip",
+                return_value=_selection(),
+            ),
+            patch(
+                "ftw_dataset_tools.api.imagery.selection_workflow.ensure_crop_calendar_exists"
+            ) as warm,
+        ):
+            result = select_imagery_for_catalog(tmp_path, year=2024, imagery_mode="mosaics")
+        assert result.successful == 1
+        warm.assert_not_called()
+
+    def test_children_written_for_a_parent_without_self_href(self, tmp_path: Path) -> None:
+        parent, path = _chip(tmp_path)
+        parent.set_self_href(None)
+        create_mosaic_child_items(path.parent, parent, _selection())
+        assert Path(parent.get_self_href()) == path
+        assert (path.parent / "chip_001_q4_s2.json").exists()
+
+
+class TestDownloadDiscovery:
+    def test_non_child_s2_files_are_ignored(self, tmp_path: Path) -> None:
+        _parent, path = _chip(tmp_path)
+        stray = pystac.Item(
+            id="notes_s2", geometry=None, bbox=None, datetime=datetime.now(UTC), properties={}
+        )
+        stray.save_object(dest_href=str(path.parent / "notes_s2.json"), include_self_link=False)
+        create_mosaic_child_items(path.parent, pystac.Item.from_file(str(path)), _selection())
+
+        ids = sorted(item.id for item, _p in find_s2_child_items(tmp_path))
+        assert ids == [f"chip_001_q{n}_s2" for n in (1, 2, 3, 4)]
+
+    def test_download_task_rejects_a_non_child_item(self, tmp_path: Path) -> None:
+        item = pystac.Item(
+            id="chip_001",
+            geometry=None,
+            bbox=list(CHIP_BBOX),
+            datetime=datetime.now(UTC),
+            properties={},
+        )
+        with pytest.raises(ValueError, match="Not an imagery child item"):
+            build_download_task(item, tmp_path / "chip_001.json")
