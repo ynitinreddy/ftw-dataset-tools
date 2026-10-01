@@ -20,6 +20,7 @@ from ftw_dataset_tools.api.imagery import (
     get_imagery_stats,
     has_existing_scenes,
 )
+from ftw_dataset_tools.api.imagery.catalog_ops import SelectionConflictError
 from ftw_dataset_tools.api.imagery.crop_calendar import ensure_crop_calendar_exists
 from ftw_dataset_tools.api.imagery.parallel import (
     MAX_WORKERS,
@@ -28,12 +29,27 @@ from ftw_dataset_tools.api.imagery.parallel import (
 )
 from ftw_dataset_tools.api.imagery.selection_workflow import (
     ChipSelectionJob,
+    resolve_selection_conflicts,
     run_chip_selection,
 )
 from ftw_dataset_tools.api.stac_items import copy_catalog
+from ftw_dataset_tools.commands.imagery_mode import (
+    imagery_mode_option,
+    reject_scene_only_options,
+    resolve_mosaic_year,
+)
 
 if TYPE_CHECKING:
     from ftw_dataset_tools.api.imagery.scene_selection import SceneSelectionResult
+
+# Options that only mean something for --imagery-mode scenes.
+_SCENE_ONLY_OPTIONS = (
+    "cloud_cover_chip",
+    "buffer_days",
+    "num_buffer_expansions",
+    "buffer_expansion_size",
+    "search_backend",
+)
 
 
 def _extract_year_from_chip_id(chip_id: str) -> int | None:
@@ -106,7 +122,7 @@ def _record_chip(
         return
 
     if on_missing == "fail":
-        raise click.ClickException(f"No cloud-free scenes for {chip_id}: {result.skipped_reason}")
+        raise click.ClickException(f"No imagery for {chip_id}: {result.skipped_reason}")
 
     skipped.append(
         {
@@ -120,11 +136,13 @@ def _record_chip(
 
 @click.command("select-images")
 @click.argument("input_path", type=click.Path(exists=True))
+@imagery_mode_option
 @click.option(
     "--year",
     type=int,
     default=None,
-    help="Calendar year for the crop cycle. If not provided, extracted from chip IDs.",
+    help="Calendar year for the crop cycle. If not provided, extracted from chip IDs. "
+    "In mosaic mode, the mosaic year (default 2025, with a warning).",
 )
 @click.option(
     "--cloud-cover-chip",
@@ -223,6 +241,7 @@ def _record_chip(
 )
 def select_images_cmd(
     input_path: str,
+    imagery_mode: str,
     year: int | None,
     cloud_cover_chip: float,
     nodata_max: float,
@@ -246,6 +265,9 @@ def select_images_cmd(
     mirror by default (--search-backend earth-search queries the Earth Search
     API instead). Creates child STAC items with remote asset links.
 
+    With --imagery-mode mosaics, selects the Q1-Q4 Sentinel-2 quarterly cloudless
+    mosaics of one year instead, falling back to the nearest years.
+
     By default, chips that already have imagery selections are skipped.
     Use --force to overwrite existing selections.
 
@@ -262,6 +284,9 @@ def select_images_cmd(
         ftwd select-images ./my-dataset --force  # Overwrite existing selections
     """
     input_path_obj = Path(input_path)
+    mosaics = imagery_mode == "mosaics"
+    if mosaics:
+        reject_scene_only_options(click.get_current_context(), _SCENE_ONLY_OPTIONS)
 
     if workers is None:
         workers = default_selection_workers(search_backend)
@@ -355,8 +380,7 @@ def select_images_cmd(
             return
 
         click.echo(click.style("\nWARNING: This will permanently delete:", fg="red", bold=True))
-        click.echo(f"  - {stats.with_imagery} planting scene STAC items")
-        click.echo(f"  - {stats.with_imagery} harvest scene STAC items")
+        click.echo(f"  - The imagery STAC items of {stats.with_imagery} chips")
         click.echo("  - Any downloaded GeoTIFF imagery files")
         click.echo("  - Imagery links from parent chip items")
         click.echo("")
@@ -386,18 +410,34 @@ def select_images_cmd(
         click.echo(f"  GeoTIFF files deleted: {total_tifs}")
         return
 
-    if year:
+    if mosaics:
+        year = resolve_mosaic_year(year)
+        click.echo(f"Imagery: quarterly mosaics, Q1-Q4 of {year}")
+    elif year:
         click.echo(f"Year: {year} (from --year option)")
     else:
         click.echo("Year: (extracted from chip IDs)")
-    click.echo(f"Cloud cover chip threshold: {cloud_cover_chip}%")
-    click.echo(
-        f"Buffer: {buffer_days} days (expand by {buffer_expansion_size}d x{num_buffer_expansions})"
-    )
+    if not mosaics:
+        click.echo(f"Cloud cover chip threshold: {cloud_cover_chip}%")
+        click.echo(
+            f"Buffer: {buffer_days} days "
+            f"(expand by {buffer_expansion_size}d x{num_buffer_expansions})"
+        )
     if verbose:
         click.echo("Verbose mode: ON")
 
     click.echo(f"\nFound {len(chip_items)} total chips")
+
+    try:
+        cleared = resolve_selection_conflicts(
+            chip_items, imagery_mode=imagery_mode, year=year, force=force
+        )
+    except SelectionConflictError as err:
+        raise click.ClickException(
+            f"{err} Pass --force to replace it, or use a new workspace."
+        ) from err
+    if cleared:
+        click.echo(f"  Cleared imagery from a different run: {cleared}")
 
     # Pre-scan to categorize chips and filter to only those needing processing
     chips_to_process: list[tuple[pystac.Item, int]] = []  # (item, year)
@@ -460,7 +500,8 @@ def select_images_cmd(
 
     # Warm the crop calendar before fanning out: every chip needs it, and the
     # first-time download must not be entered by several workers at once.
-    ensure_crop_calendar_exists(on_progress=lambda msg: click.echo(f"  {msg}"))
+    if not mosaics:
+        ensure_crop_calendar_exists(on_progress=lambda msg: click.echo(f"  {msg}"))
 
     def work(job: ChipSelectionJob) -> SceneSelectionResult:
         return run_chip_selection(
@@ -471,6 +512,7 @@ def select_images_cmd(
             num_buffer_expansions=num_buffer_expansions,
             buffer_expansion_size=buffer_expansion_size,
             search_backend=search_backend,
+            imagery_mode=imagery_mode,
         )
 
     with ImageryProgressBar(total=len(jobs), leave=True, verbose=verbose) as progress:
@@ -488,8 +530,10 @@ def select_images_cmd(
         run_in_parallel(jobs, work=work, apply=apply, workers=workers)
 
     # Categorize skipped items
+    no_imagery = "No complete mosaic year" if mosaics else "No cloud-free"
+    no_imagery_label = no_imagery if mosaics else "No cloud-free scenes"
     already_has = [s for s in skipped if s["reason"] == "Already has imagery selections"]
-    no_scenes = [s for s in skipped if "No cloud-free" in s.get("reason", "")]
+    no_scenes = [s for s in skipped if no_imagery in (s.get("reason") or "")]
     other_skipped = [s for s in skipped if s not in already_has and s not in no_scenes]
 
     # Get final stats
@@ -500,7 +544,7 @@ def select_images_cmd(
     click.echo("Summary:")
     click.echo(f"  Newly selected: {len(successful)}")
     click.echo(f"  Already had imagery: {len(already_has)}")
-    click.echo(f"  No cloud-free scenes: {len(no_scenes)}")
+    click.echo(f"  {no_imagery_label}: {len(no_scenes)}")
     if other_skipped:
         click.echo(f"  Other skipped: {len(other_skipped)}")
     click.echo(f"  Failed: {len(failed)}")
@@ -509,7 +553,9 @@ def select_images_cmd(
     click.echo(f"  Still without imagery: {final_stats.without_imagery}")
 
     if no_scenes:
-        click.echo(click.style(f"\n{len(no_scenes)} chips without cloud-free scenes:", fg="yellow"))
+        click.echo(
+            click.style(f"\n{len(no_scenes)} chips with {no_imagery_label.lower()}:", fg="yellow")
+        )
         for s in no_scenes[:5]:
             click.echo(f"  - {s['chip']}: {s['reason']}")
         if len(no_scenes) > 5:
@@ -537,6 +583,7 @@ def select_images_cmd(
             "skipped": skipped,
             "failed": failed,
             "parameters": {
+                "imagery_mode": imagery_mode,
                 "year": year if year else "extracted_from_chip_ids",
                 "cloud_cover_chip": cloud_cover_chip,
                 "buffer_days": buffer_days,

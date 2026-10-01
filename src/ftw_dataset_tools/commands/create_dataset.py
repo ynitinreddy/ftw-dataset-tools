@@ -14,9 +14,24 @@ from ftw_dataset_tools.api.imagery import (
     download_imagery_for_catalog,
     select_imagery_for_catalog,
 )
+from ftw_dataset_tools.api.imagery.catalog_ops import SelectionConflictError
 from ftw_dataset_tools.api.imagery.parallel import DEFAULT_WORKERS, MAX_WORKERS
 from ftw_dataset_tools.api.pipeline import docs_summary_line
 from ftw_dataset_tools.api.stac import detect_datetime_column, get_year_from_datetime_column
+from ftw_dataset_tools.commands.imagery_mode import (
+    imagery_mode_option,
+    reject_scene_only_options,
+    resolve_mosaic_year,
+)
+
+# Options that only mean something for --imagery-mode scenes.
+_SCENE_ONLY_OPTIONS = (
+    "cloud_cover_chip",
+    "buffer_days",
+    "num_buffer_expansions",
+    "buffer_expansion_size",
+    "search_backend",
+)
 
 
 @click.command("create-dataset")
@@ -120,6 +135,7 @@ from ftw_dataset_tools.api.stac import detect_datetime_column, get_year_from_dat
     default=False,
     help="Download images after selection.",
 )
+@imagery_mode_option
 @click.option(
     "--cloud-cover-chip",
     type=click.FloatRange(0.0, 100.0),
@@ -228,6 +244,7 @@ def create_dataset_cmd(
     year: int | None,
     skip_images: bool,
     download_images: bool,
+    imagery_mode: str,
     cloud_cover_chip: float,
     nodata_max: float,
     buffer_days: int,
@@ -352,6 +369,12 @@ def create_dataset_cmd(
         # Image selection (by default enabled, unless --skip-images is set)
         should_select_images = not skip_images or download_images
 
+        # Mosaic checks run before the masks are built, so a bad flag fails fast.
+        mosaic_year = None
+        if should_select_images and imagery_mode == "mosaics":
+            reject_scene_only_options(click.get_current_context(), _SCENE_ONLY_OPTIONS)
+            mosaic_year = resolve_mosaic_year(year)
+
         def select_and_download(catalog_dir: Path) -> None:
             """Select (and optionally download) imagery for the written collection.
 
@@ -361,7 +384,7 @@ def create_dataset_cmd(
             that already has its imagery.
             """
             # Try to extract year from determination_datetime if not provided
-            effective_year = year
+            effective_year = mosaic_year or year
             if effective_year is None:
                 datetime_col = detect_datetime_column(fields_file)
                 if datetime_col:
@@ -384,18 +407,24 @@ def create_dataset_cmd(
             # generation carries those links across a rebuild, so re-running
             # create-dataset resumes instead of starting over unless
             # --force-image-selection is passed.
-            selection = select_imagery_for_catalog(
-                catalog_dir=catalog_dir,
-                year=effective_year,
-                cloud_cover_chip=cloud_cover_chip,
-                nodata_max=nodata_max,
-                buffer_days=buffer_days,
-                num_buffer_expansions=num_buffer_expansions,
-                buffer_expansion_size=buffer_expansion_size,
-                force=force_image_selection,
-                workers=image_workers,
-                search_backend=search_backend,
-            )
+            try:
+                selection = select_imagery_for_catalog(
+                    catalog_dir=catalog_dir,
+                    year=effective_year,
+                    cloud_cover_chip=cloud_cover_chip,
+                    nodata_max=nodata_max,
+                    buffer_days=buffer_days,
+                    num_buffer_expansions=num_buffer_expansions,
+                    buffer_expansion_size=buffer_expansion_size,
+                    force=force_image_selection,
+                    workers=image_workers,
+                    search_backend=search_backend,
+                    imagery_mode=imagery_mode,
+                )
+            except SelectionConflictError as err:
+                raise click.ClickException(
+                    f"{err} Pass --force-image-selection to replace it, or use a new output dir."
+                ) from err
 
             click.echo(f"  Selected: {selection.successful}")
             click.echo(f"  Skipped: {selection.skipped}")

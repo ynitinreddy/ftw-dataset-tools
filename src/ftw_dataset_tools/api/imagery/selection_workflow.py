@@ -20,8 +20,15 @@ from typing import TYPE_CHECKING, Literal
 
 import pystac
 
-from ftw_dataset_tools.api.imagery.catalog_ops import has_existing_scenes, iter_chip_dirs
+from ftw_dataset_tools.api.imagery.catalog_ops import (
+    SelectionConflictError,
+    clear_chip_selections,
+    has_existing_scenes,
+    iter_chip_dirs,
+    selection_conflict,
+)
 from ftw_dataset_tools.api.imagery.crop_calendar import ensure_crop_calendar_exists
+from ftw_dataset_tools.api.imagery.mosaic_selection import select_mosaics_for_chip
 from ftw_dataset_tools.api.imagery.parallel import (
     DEFAULT_WORKERS,
     ParallelOutcome,
@@ -29,17 +36,23 @@ from ftw_dataset_tools.api.imagery.parallel import (
 )
 from ftw_dataset_tools.api.imagery.progress import ImageryProgressBar
 from ftw_dataset_tools.api.imagery.scene_selection import select_scenes_for_chip
-from ftw_dataset_tools.api.imagery.stac_child_items import create_child_items_from_selection
+from ftw_dataset_tools.api.imagery.slots import DEFAULT_IMAGERY_MODE, parse_child_id
+from ftw_dataset_tools.api.imagery.stac_child_items import (
+    create_child_items_from_selection,
+    create_mosaic_child_items,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from ftw_dataset_tools.api.imagery.mosaic_selection import MosaicSelectionResult
     from ftw_dataset_tools.api.imagery.scene_selection import SceneSelectionResult
 
 __all__ = [
     "ChipSelectionJob",
     "SelectionWorkflowResult",
     "find_chip_items",
+    "resolve_selection_conflicts",
     "run_chip_selection",
     "select_imagery_for_catalog",
 ]
@@ -69,12 +82,25 @@ def run_chip_selection(
     num_buffer_expansions: int,
     buffer_expansion_size: int,
     search_backend: str = "parquet",
-) -> SceneSelectionResult:
-    """Select scenes for one chip and write its child items.
+    imagery_mode: str = DEFAULT_IMAGERY_MODE,
+) -> SceneSelectionResult | MosaicSelectionResult:
+    """Select imagery for one chip and write its child items.
 
     Safe to run on a worker thread: every chip queries the scene catalog on its
     own and writes only into its own directory.
     """
+    if imagery_mode == "mosaics":
+        mosaics = select_mosaics_for_chip(
+            chip_id=job.item.id,
+            bbox=tuple(job.item.bbox),
+            year=job.year,
+            nodata_max=nodata_max,
+            on_progress=job.logs.append,
+        )
+        if mosaics.success:
+            create_mosaic_child_items(job.item_path.parent, job.item, mosaics)
+        return mosaics
+
     selection = select_scenes_for_chip(
         chip_id=job.item.id,
         bbox=tuple(job.item.bbox),
@@ -121,7 +147,7 @@ def find_chip_items(
     """Find all parent chip items in a catalog directory.
 
     Searches subdirectories for STAC item JSON files, excluding child S2 items
-    (those ending in _planting_s2 or _harvest_s2).
+    (``{chip}_{slot}_s2``).
 
     Args:
         catalog_dir: Path to the collection directory (holding collection.json),
@@ -140,8 +166,7 @@ def find_chip_items(
 
     for subdir in iter_chip_dirs(catalog_dir):
         for json_file in subdir.glob("*.json"):
-            # Skip child items (they have _planting_s2 or _harvest_s2 suffix)
-            if "_planting_s2" in json_file.name or "_harvest_s2" in json_file.name:
+            if parse_child_id(json_file.stem) is not None:
                 continue
             try:
                 item = pystac.Item.from_file(str(json_file))
@@ -152,6 +177,33 @@ def find_chip_items(
             chip_items.append((item, json_file))
 
     return chip_items
+
+
+def resolve_selection_conflicts(
+    items: list[pystac.Item], *, imagery_mode: str, year: int | None, force: bool
+) -> int:
+    """Stop before chips holding another mode's or year's imagery get mixed in.
+
+    Without ``force`` raises SelectionConflictError; with it, clears those chips so
+    they are selected afresh. Returns how many chips were cleared.
+    """
+    conflicts = [
+        (item, reason)
+        for item in items
+        if (reason := selection_conflict(item, imagery_mode, year)) is not None
+    ]
+    if not conflicts:
+        return 0
+    if not force:
+        item, reason = conflicts[0]
+        wanted = f"mosaics for {year}" if imagery_mode == "mosaics" else "scenes"
+        raise SelectionConflictError(
+            f"{len(conflicts)} chip(s) already hold imagery from a different run "
+            f"(e.g. {item.id} {reason}; this run selects {wanted})."
+        )
+    for item, _reason in conflicts:
+        clear_chip_selections(item)
+    return len(conflicts)
 
 
 def select_imagery_for_catalog(
@@ -167,6 +219,7 @@ def select_imagery_for_catalog(
     verbose: bool = False,
     workers: int = DEFAULT_WORKERS,
     search_backend: str = "parquet",
+    imagery_mode: str = DEFAULT_IMAGERY_MODE,
 ) -> SelectionWorkflowResult:
     """Select imagery for all chips in a catalog.
 
@@ -175,7 +228,7 @@ def select_imagery_for_catalog(
 
     Args:
         catalog_dir: Path to the chips collection directory
-        year: Calendar year for the crop cycle
+        year: Calendar year for the crop cycle (the mosaic year in mosaic mode)
         cloud_cover_chip: Maximum chip-level cloud cover percentage (0-100)
         nodata_max: Maximum nodata percentage (0-100). Default 0 rejects any nodata.
         buffer_days: Days to search around crop calendar dates
@@ -189,12 +242,15 @@ def select_imagery_for_catalog(
         workers: Number of chips to select for concurrently
         search_backend: "parquet" (the STAC-GeoParquet mirror, default) or
                         "earth-search" (the Earth Search STAC API)
+        imagery_mode: "scenes" (planting/harvest) or "mosaics" (Q1-Q4)
 
     Returns:
         SelectionWorkflowResult with success/skipped/failed counts and details
 
     Raises:
         Exception: If on_missing="fail" and no cloud-free scenes found
+        SelectionConflictError: If chips hold another mode's or year's imagery
+            and ``force`` is False
     """
     result = SelectionWorkflowResult()
 
@@ -207,6 +263,10 @@ def select_imagery_for_catalog(
 
     if not chip_items:
         return result
+
+    resolve_selection_conflicts(
+        [item for item, _path in chip_items], imagery_mode=imagery_mode, year=year, force=force
+    )
 
     # Pre-filter chips that already have imagery (unless force=True)
     chips_to_process: list[tuple[pystac.Item, Path]] = []
@@ -234,7 +294,8 @@ def select_imagery_for_catalog(
 
     # Warm the crop calendar before fanning out. Every chip needs it, and the
     # first-time download must happen once rather than from every worker at once.
-    ensure_crop_calendar_exists()
+    if imagery_mode != "mosaics":
+        ensure_crop_calendar_exists()
 
     _run_selection(
         chips_to_process,
@@ -249,6 +310,7 @@ def select_imagery_for_catalog(
         verbose=verbose,
         workers=workers,
         search_backend=search_backend,
+        imagery_mode=imagery_mode,
     )
 
     return result
@@ -268,6 +330,7 @@ def _run_selection(
     verbose: bool,
     workers: int,
     search_backend: str = "parquet",
+    imagery_mode: str = DEFAULT_IMAGERY_MODE,
 ) -> None:
     """Select scenes for every chip on a thread pool, recording outcomes as they finish.
 
@@ -281,7 +344,7 @@ def _run_selection(
         for item, item_path in chips_to_process
     ]
 
-    def work(job: ChipSelectionJob) -> SceneSelectionResult:
+    def work(job: ChipSelectionJob) -> SceneSelectionResult | MosaicSelectionResult:
         return run_chip_selection(
             job,
             cloud_cover_chip=cloud_cover_chip,
@@ -290,6 +353,7 @@ def _run_selection(
             num_buffer_expansions=num_buffer_expansions,
             buffer_expansion_size=buffer_expansion_size,
             search_backend=search_backend,
+            imagery_mode=imagery_mode,
         )
 
     with ImageryProgressBar(total=len(jobs), leave=False, verbose=verbose) as progress:
