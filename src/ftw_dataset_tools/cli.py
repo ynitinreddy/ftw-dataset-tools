@@ -4,6 +4,7 @@ import click
 
 from ftw_dataset_tools import __version__
 from ftw_dataset_tools.commands.add_field_stats import add_field_stats
+from ftw_dataset_tools.commands.cli_logging import configure_cli_logging
 from ftw_dataset_tools.commands.convert_previews import convert_previews
 from ftw_dataset_tools.commands.create_boundaries import create_boundaries
 from ftw_dataset_tools.commands.create_chips import create_chips
@@ -21,7 +22,8 @@ from ftw_dataset_tools.commands.select_images import select_images
 
 @click.group()
 @click.version_option(version=__version__, prog_name="ftwd")
-def cli() -> None:
+@click.option("-v", "--verbose", is_flag=True, help="Show debug output.")
+def cli(verbose: bool) -> None:
     """FTW Dataset Tools - CLI for creating Fields of the World benchmark dataset.
 
     This tool provides commands for:
@@ -32,6 +34,7 @@ def cli() -> None:
     - Creating chip definitions with field coverage statistics
     - Creating boundary lines and raster masks
     """
+    configure_cli_logging(verbose)
 
 
 # Register commands
