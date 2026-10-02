@@ -86,6 +86,7 @@ describing how the whole dataset was built:
 | `ftw:split_type` | string | Split strategy used: `random-uniform`, `block3x3`, `block3x3-hash` or `predefined` |
 | `ftw:split_seed` | integer | Random seed used for split assignment |
 | `ftw:split_percents` | integer[3] | Train/val/test split percentages |
+| `ftw:chip_size_km` | number | Chip edge length in kilometres (2 for the FTW grid; smaller chips have longer ids, see below) |
 | `ftw:mask_types` | string[] | Mask types generated for the dataset |
 | `ftw:mask_resolution_m` | number | Mask pixel resolution in meters |
 | `ftw:presence_only` | boolean | Whether labels are presence-only (background class value is 3 instead of 0) |
@@ -450,6 +451,23 @@ All files include the calendar year for consistency. Chip item files and their a
 - Mask files: `chips/{mgrs100k}/{item_id}/{item_id}_{mask_type}.tif`
 
 where `{mgrs100k}` is the MGRS 100 km square (or `other` for custom grids) and `{item_id}` is the chip identifier.
+
+### Chip ids
+
+A chip id is `ftw-{mgrs100k}{easting}{northing}`: the south-west corner of the chip as an
+offset inside its MGRS 100 km square. The offsets use the coarsest MGRS precision that places
+every corner of the dataset's chip size (`ftw:chip_size_km`) exactly, so the digit count grows
+as chips shrink below 1 km:
+
+| Chip size | Digits per axis | Example |
+|-----------|-----------------|---------|
+| Whole kilometres (the 2 km FTW grid) | 2 (1 km) | `ftw-33UXP0410` |
+| Multiples of 100 m (e.g. 0.5, 0.1 km) | 3 (100 m) | `ftw-33UXP041100` |
+| Multiples of 10 m (e.g. 0.25 km) | 4 (10 m) | `ftw-33UXP04101000` |
+| Any other whole metre (e.g. 0.256 km) | 5 (1 m) | `ftw-33UXP0410010000` |
+
+An id names a corner, not a size: the same corner has the same id at every chip size that shares
+its precision, so read `ftw:chip_size_km` to know a chip's extent.
 
 ## Future Work
 

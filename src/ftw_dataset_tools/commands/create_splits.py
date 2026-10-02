@@ -3,6 +3,7 @@
 import click
 
 from ftw_dataset_tools.api import splits
+from ftw_dataset_tools.commands.options import KM_SIZE, KM_SIZE_HELP
 
 
 @click.command("create-splits")
@@ -21,9 +22,10 @@ from ftw_dataset_tools.api import splits
 )
 @click.option(
     "--km-size",
-    type=click.FloatRange(min=1),
+    type=KM_SIZE,
     default=None,
-    help="Grid cell size in km for block split types. Inferred from chip IDs if omitted.",
+    help=f"{KM_SIZE_HELP} Sets the 3x3 blocks of block split types; inferred from chip "
+    "IDs if omitted.",
 )
 @click.option(
     "--fields-file",

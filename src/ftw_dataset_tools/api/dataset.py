@@ -56,6 +56,7 @@ def create_dataset(
     split_type: str | None = None,
     split_percents: tuple[int, int, int] = (80, 10, 10),
     min_coverage: float = 0.01,
+    km_size: float = field_stats.DEFAULT_CHIP_KM_SIZE,
     resolution: float = 10.0,
     num_workers: int | None = None,
     skip_reproject: bool = False,
@@ -98,6 +99,8 @@ def create_dataset(
         split_type: Dataset split strategy
         split_percents: Train/val/test percentages (must be three integers summing to 100; default: 80 10 10)
         min_coverage: Minimum coverage percentage to include grids (default: 0.01)
+        km_size: Chip edge length in kilometres (default: 2.0); the 2 km FTW grid is
+            cut to this size, e.g. 0.1 for 100 m chips
         resolution: Pixel resolution in meters for masks (default: 10.0)
         num_workers: Number of parallel workers for mask creation
         skip_reproject: If True, fail instead of reprojecting non-4326 inputs
@@ -146,6 +149,7 @@ def create_dataset(
         border_gap_chips=border_gap_chips,
         scale_percent=scale_percent,
         scale_min_blocks=scale_min_blocks,
+        km_size=km_size,
     )
     config.stages.stac.checksums = checksums
     if class_filter is not None:

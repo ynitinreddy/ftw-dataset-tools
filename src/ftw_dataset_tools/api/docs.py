@@ -599,6 +599,9 @@ def _config_lines(collection: dict, config_dict: dict) -> list[str]:
     splits = stages.get("splits") or {}
     masks = stages.get("masks") or {}
     lines = []
+    chip_km = (stages.get("chips") or {}).get("km_size") or collection.get("ftw:chip_size_km")
+    if chip_km:
+        lines.append(f"- Chips are {chip_km:g} km ({chip_km * 1000:,.0f} m) on a side")
     split_type = splits.get("split_type") or collection.get("ftw:split_type")
     if split_type:
         seed = splits.get("random_seed")

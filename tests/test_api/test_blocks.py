@@ -22,6 +22,30 @@ class TestChipBlockIds:
         assert chip_block_ids(ids).nunique() == 1
         assert chip_block_ids(ids, km_size=2).tolist() == ["36NXF_0_0", "36NXF_2_0"]
 
+    def test_sub_km_chips_group_three_cells(self) -> None:
+        # 500 m chips: 3-digit offsets in 100 m units, three cells (1.5 km) per block.
+        ids = pd.Series(
+            ["ftw-36NXF000000", "ftw-36NXF010000", "ftw-36NXF015000", "ftw-36NXF000015"]
+        )
+        assert chip_block_ids(ids, km_size=0.5).tolist() == [
+            "36NXF_0_0",
+            "36NXF_0_0",
+            "36NXF_1_0",
+            "36NXF_0_1",
+        ]
+
+    def test_sub_km_step_is_inferred_from_the_ids(self) -> None:
+        ids = pd.Series(["ftw-36NXF000000", "ftw-36NXF001000", "ftw-36NXF003000"])
+        assert chip_block_ids(ids).tolist() == ["36NXF_0_0", "36NXF_0_0", "36NXF_1_0"]
+
+    def test_metre_precision_ids(self) -> None:
+        ids = pd.Series(["ftw-36NXF0000000000", "ftw-36NXF0076800000"])
+        assert chip_block_ids(ids, km_size=0.256).tolist() == ["36NXF_0_0", "36NXF_1_0"]
+
+    def test_single_chip_falls_back_to_the_id_precision(self) -> None:
+        # Matches the 1 km fallback 2-digit ids always had.
+        assert chip_block_ids(pd.Series(["ftw-36NXF6658"])).tolist() == ["36NXF_22_19"]
+
     def test_rejects_short_ids(self) -> None:
         with pytest.raises(ValueError, match="at least 13 characters"):
             chip_block_ids(pd.Series(["short-id"]))
@@ -36,7 +60,10 @@ class TestChipBlockIds:
 
 
 def test_mgrs_squares() -> None:
-    assert mgrs_squares(pd.Series(["ftw-36NXF6658"])).tolist() == ["36NXF"]
+    assert mgrs_squares(pd.Series(["ftw-36NXF6658", "ftw-4QFJ665581"])).tolist() == [
+        "36NXF",
+        "4QFJ",
+    ]
 
 
 class TestBlockScores:

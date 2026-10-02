@@ -3,6 +3,7 @@
 import click
 
 from ftw_dataset_tools.api import field_stats, scale
+from ftw_dataset_tools.commands.options import KM_SIZE, KM_SIZE_HELP
 
 
 @click.command("create-subset")
@@ -22,10 +23,10 @@ from ftw_dataset_tools.api import field_stats, scale
 )
 @click.option(
     "--km-size",
-    type=click.FloatRange(min=1),
+    type=KM_SIZE,
     default=field_stats.DEFAULT_CHIP_KM_SIZE,
     show_default=True,
-    help="Grid cell size in km.",
+    help=KM_SIZE_HELP,
 )
 def create_subset(chips_file: str, percent: float, min_blocks: int, km_size: float) -> None:
     """Keep a reproducible scale of a chips file, in place.

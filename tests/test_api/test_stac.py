@@ -711,6 +711,7 @@ class TestCollectionMetadata:
         assert coll["ftw:split_percents"] == [80, 10, 10]
         assert coll["ftw:mask_types"] == ["instance", "semantic_2_class", "semantic_3_class"]
         assert coll["ftw:mask_resolution_m"] == 10.0
+        assert coll["ftw:chip_size_km"] == 2.0
         assert "ftw:cloud_cover_chip_threshold" in coll  # select_images enabled by default
         assert coll["ftw:config"]["config"]["metadata"]["license"] == "CC0-1.0"
         assert coll["updated"] == provenance["generated_at"].replace("+00:00", "Z")

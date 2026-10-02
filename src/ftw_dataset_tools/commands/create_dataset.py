@@ -7,7 +7,16 @@ from pathlib import Path
 
 import click
 
-from ftw_dataset_tools.api import chip_borders, crop_stats, dataset, masks, scale, splits
+from ftw_dataset_tools.api import (
+    chip_borders,
+    chip_grid,
+    crop_stats,
+    dataset,
+    field_stats,
+    masks,
+    scale,
+    splits,
+)
 from ftw_dataset_tools.api.assets import MaskReadError
 from ftw_dataset_tools.api.config import DEFAULT_MASK_TYPES, PMTILES_AUTO, VALID_MASK_TYPES
 from ftw_dataset_tools.api.imagery import (
@@ -17,6 +26,7 @@ from ftw_dataset_tools.api.imagery import (
 from ftw_dataset_tools.api.imagery.parallel import DEFAULT_WORKERS, MAX_WORKERS
 from ftw_dataset_tools.api.pipeline import docs_summary_line
 from ftw_dataset_tools.api.stac import detect_datetime_column, get_year_from_datetime_column
+from ftw_dataset_tools.commands.options import KM_SIZE, KM_SIZE_HELP
 
 
 @click.command("create-dataset")
@@ -61,6 +71,13 @@ from ftw_dataset_tools.api.stac import detect_datetime_column, get_year_from_dat
     default=0.01,
     show_default=True,
     help="Minimum coverage percentage to include grids.",
+)
+@click.option(
+    "--km-size",
+    type=KM_SIZE,
+    default=field_stats.DEFAULT_CHIP_KM_SIZE,
+    show_default=True,
+    help=f"{KM_SIZE_HELP} The 2 km FTW grid is cut to this size.",
 )
 @click.option(
     "--resolution",
@@ -236,6 +253,7 @@ def create_dataset_cmd(
     split_type: str,
     split_percents: tuple[int, int, int],
     min_coverage: float,
+    km_size: float,
     resolution: float,
     num_workers: int | None,
     image_workers: int,
@@ -301,6 +319,7 @@ def create_dataset_cmd(
         ftwd create-dataset fields.parquet --split-type random-uniform --min-coverage 1.0 --resolution 5.0 --year 2024
         ftwd create-dataset fields.parquet --split-type block3x3 --mask-types semantic_2_class,semantic_3_class --year 2023
         ftwd create-dataset fields.parquet --split-type block3x3 --presence-only --year 2023
+        ftwd create-dataset fields.parquet --split-type block3x3 --km-size 0.5 --year 2023
     """
     # Derive output directory from input filename if not specified
     if output_dir is None:
@@ -310,6 +329,7 @@ def create_dataset_cmd(
     click.echo(click.style("Creating dataset from fields file", fg="cyan", bold=True))
     click.echo(f"Input: {fields_file}")
     click.echo(f"Output: {output_dir}")
+    click.echo(f"Chip size: {chip_grid.chip_size_label(km_size)} (--km-size is in kilometres)")
 
     # Progress callback for general messages
     def on_progress(msg: str) -> None:
@@ -451,6 +471,7 @@ def create_dataset_cmd(
             split_type=split_type,
             split_percents=validated_split_percents,
             min_coverage=min_coverage,
+            km_size=km_size,
             resolution=resolution,
             num_workers=num_workers,
             skip_reproject=skip_reproject,

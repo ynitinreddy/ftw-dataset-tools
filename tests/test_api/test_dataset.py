@@ -174,6 +174,7 @@ class TestCreateDatasetSignature:
         assert sig.parameters["output_dir"].default == "./dataset"
         assert sig.parameters["min_coverage"].default == 0.01
         assert sig.parameters["resolution"].default == 10.0
+        assert sig.parameters["km_size"].default == 2.0
         assert sig.parameters["skip_reproject"].default is False
 
 
@@ -185,6 +186,7 @@ class TestCreateDatasetChecksumsFlag:
 
         def fake_run_pipeline(ctx, _stages, **_kwargs):
             captured["checksums"] = ctx.config.stages.stac.checksums
+            captured["km_size"] = ctx.config.stages.chips.km_size
             return ctx
 
         monkeypatch.setattr(dataset_module.pipeline, "run_pipeline", fake_run_pipeline)
@@ -202,9 +204,11 @@ class TestCreateDatasetChecksumsFlag:
             split_type="random-uniform",
             year=2024,
             checksums=True,
+            km_size=0.1,
         )
 
         assert captured["checksums"] is True
+        assert captured["km_size"] == 0.1
 
 
 class TestCreateDatasetStageOrder:

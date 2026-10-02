@@ -65,3 +65,49 @@ def test_create_splits_km_size(tmp_path: Path) -> None:
 
     assert result.exit_code == 0, result.output
     assert set(gpd.read_parquet(path)["split"]) == {"train", "test"}
+
+
+def test_create_subset_sub_km_ids(tmp_path: Path) -> None:
+    ids = [f"ftw-33UXP{e:03d}{n:03d}" for e in range(0, 90, 5) for n in range(0, 90, 5)]
+    path = _chips(tmp_path / "chips.parquet", ids)
+
+    result = CliRunner().invoke(
+        cli, ["create-subset", str(path), "--percent", "50", "--km-size", "0.5"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert 0 < len(gpd.read_parquet(path)) < len(ids)
+
+
+def test_create_splits_sub_km_size(tmp_path: Path) -> None:
+    path = _chips(tmp_path / "chips.parquet", ["ftw-33UXP000000", "ftw-33UXP060000"])
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "create-splits",
+            str(path),
+            "--split-type",
+            "block3x3",
+            "--split-percents",
+            "50",
+            "0",
+            "50",
+            "--km-size",
+            "0.5",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert set(gpd.read_parquet(path)["split"]) == {"train", "test"}
+
+
+def test_km_size_in_metres_rejected(tmp_path: Path) -> None:
+    path = _chips(tmp_path / "chips.parquet", ["ftw-33UXP0000"])
+
+    result = CliRunner().invoke(
+        cli, ["create-subset", str(path), "--percent", "50", "--km-size", "500"]
+    )
+
+    assert result.exit_code != 0
+    assert "kilometres" in result.output

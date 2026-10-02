@@ -1052,7 +1052,7 @@ class TestChipsStageBatchSize:
             sample_geoparquet_4326,
             tmp_path / "out",
             year=2024,
-            stages={"chips": {"coverage_batch_size": 37, "crop_stats": False}},
+            stages={"chips": {"coverage_batch_size": 37, "crop_stats": False, "km_size": 0.5}},
         )
         ctx = pipeline.build_context(config)
         ctx.output_dir.mkdir(parents=True)
@@ -1079,6 +1079,7 @@ class TestChipsStageBatchSize:
         pipeline.stage_chips(ctx)
 
         assert seen["batch_size"] == 37
+        assert seen["km_size"] == 0.5
 
 
 class TestChipsStageCropStats:
