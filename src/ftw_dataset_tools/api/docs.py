@@ -83,6 +83,7 @@ CHIP_COLUMN_NOTES = {
     "split": "which benchmark split the chip belongs to (train / val / test)",
     "field_coverage_pct": "percent of the chip's area covered by mapped field polygons",
     "field_count": "number of field polygons intersecting the chip",
+    "scale_score": "stable hash score of the chip's 3x3 block; a scale keeps scores below it",
     **_HCAT_NOTES,
     "gzd": "MGRS grid zone designator of the chip's grid cell",
     "mgrs_10km": "MGRS 100 km square plus 10 km cell identifier the chip belongs to",
@@ -92,6 +93,7 @@ CHIP_COLUMN_NOTES = {
 
 ITEM_PROPERTY_NOTES = {
     "ftw:split": "which benchmark split the chip belongs to (train / val / test)",
+    "ftw:scale_score": "stable hash score of the chip's 3x3 block; a scale keeps scores below it",
     "ftw:calendar_year": "calendar year of the crop cycle the chip documents",
     "ftw:planting_day": "day of year the planting window is centred on",
     "ftw:harvest_day": "day of year the harvest window is centred on",

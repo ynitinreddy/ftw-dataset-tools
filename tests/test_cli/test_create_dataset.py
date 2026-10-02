@@ -45,6 +45,35 @@ class TestCreateDatasetCommand:
         result = runner.invoke(cli, ["create-dataset", "/nonexistent/fields.parquet"])
         assert result.exit_code != 0
 
+    def test_scale_options_reach_create_dataset(
+        self, sample_fields_geoparquet: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: dict[str, Any] = {}
+
+        def fake_create_dataset(**kwargs: Any) -> CreateDatasetResult:
+            captured.update(kwargs)
+            raise SystemExit(0)
+
+        monkeypatch.setattr(create_dataset_module.dataset, "create_dataset", fake_create_dataset)
+
+        CliRunner().invoke(
+            cli,
+            [
+                "create-dataset",
+                str(sample_fields_geoparquet),
+                "--split-type",
+                "block3x3-hash",
+                "--scale-percent",
+                "10",
+                "--scale-min-blocks",
+                "0",
+            ],
+        )
+
+        assert captured["split_type"] == "block3x3-hash"
+        assert captured["scale_percent"] == 10
+        assert captured["scale_min_blocks"] == 0
+
 
 class TestCreateDatasetMaskTypes:
     """Tests for --mask-types parsing and validation."""

@@ -48,6 +48,7 @@ independently of imagery:
 | `ftw:hcat_dominant_name_en` | string | English name of the dominant HCAT code |
 | `ftw:hcat_dominant_pct` | number | Area share (0-100) of the dominant HCAT code |
 | `ftw:hcat_top` | array | Top HCAT codes by area, each `{code, name_en, pct}` |
+| `ftw:scale_score` | number | Stable hash score in [0, 1) of the chip's 3x3 block (present only for scaled datasets) |
 
 The `ftw:hcat_*` properties are only present when the field polygons carry the fiboa
 HCAT extension (an `hcat:code` column); otherwise crop composition is skipped and these
@@ -82,13 +83,16 @@ describing how the whole dataset was built:
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `ftw:split_type` | string | Split strategy used: `random-uniform` or `block3x3` |
+| `ftw:split_type` | string | Split strategy used: `random-uniform`, `block3x3`, `block3x3-hash` or `predefined` |
 | `ftw:split_seed` | integer | Random seed used for split assignment |
 | `ftw:split_percents` | integer[3] | Train/val/test split percentages |
 | `ftw:mask_types` | string[] | Mask types generated for the dataset |
 | `ftw:mask_resolution_m` | number | Mask pixel resolution in meters |
 | `ftw:presence_only` | boolean | Whether labels are presence-only (background class value is 3 instead of 0) |
 | `ftw:min_coverage_pct` | number | Minimum field-coverage percentage required to keep a grid cell |
+| `ftw:scale_percent` | number | Percent of 3x3 chip blocks kept (present only for scaled datasets) |
+| `ftw:scale_min_blocks_per_square` | integer | Blocks always kept per MGRS 100 km square (present only for scaled datasets) |
+| `ftw:scale_version` | string | Hash version used to score blocks (present only for scaled datasets) |
 | `ftw:cloud_cover_chip_threshold` | number | Chip-level cloud cover threshold percentage (present only when image selection is enabled) |
 | `ftw:nodata_max` | number | Maximum allowed nodata percentage (0-100) for a selected scene (present only when image selection is enabled) |
 | `ftw:buffer_days` | integer | Search buffer in days around crop calendar dates (present only when image selection is enabled) |

@@ -11,6 +11,7 @@ from ftw_dataset_tools.api import (
     field_stats,
     masks,
     pipeline,
+    scale,
     splits,
     stac,
 )
@@ -65,6 +66,8 @@ def create_dataset(
     border_gap_chips: int = DEFAULT_BORDER_GAP_CHIPS,
     checksums: bool = False,
     class_filter: str | Path | None = None,
+    scale_percent: float = scale.DEFAULT_SCALE_PERCENT,
+    scale_min_blocks: int = scale.DEFAULT_MIN_BLOCKS_PER_SQUARE,
     on_imagery: Callable[[Path], None] | None = None,
     on_progress: Callable[[str], None] | None = None,
     on_mask_progress: Callable[[int, int], None] | None = None,
@@ -106,6 +109,8 @@ def create_dataset(
         checksums: Compute file:checksum for every asset (slow; default False).
         class_filter: Optional path to a class filter YAML (column + include/exclude
             lists). Include classes count as field; all others become background.
+        scale_percent: Percent of 3x3 chip blocks to keep (default 100 keeps all).
+        scale_min_blocks: Blocks always kept per MGRS 100 km square when scaling.
         on_imagery: Optional callback given the collection directory, invoked at the
             imagery stages' position in the pipeline. ``create-dataset`` selects and
             downloads imagery itself through this hook, so the documents it writes
@@ -139,6 +144,8 @@ def create_dataset(
         presence_only=presence_only,
         drop_border_chips=drop_border_chips,
         border_gap_chips=border_gap_chips,
+        scale_percent=scale_percent,
+        scale_min_blocks=scale_min_blocks,
     )
     config.stages.stac.checksums = checksums
     if class_filter is not None:

@@ -747,6 +747,21 @@ class TestCollectionMetadata:
         coll = json.loads(result.collection_path.read_text())
         assert "ftw:split_type" not in coll
 
+    def test_scale_properties_only_for_scaled_datasets(self) -> None:
+        from ftw_dataset_tools.api.config import DatasetConfig
+        from ftw_dataset_tools.api.stac import _collection_ftw_properties
+
+        full = DatasetConfig.from_dict({"fields_file": "f.parquet"})
+        assert "ftw:scale_percent" not in _collection_ftw_properties(full)
+
+        scaled = DatasetConfig.from_dict(
+            {"fields_file": "f.parquet", "stages": {"scale": {"percent": 10}}}
+        )
+        props = _collection_ftw_properties(scaled)
+        assert props["ftw:scale_percent"] == 10
+        assert props["ftw:scale_min_blocks_per_square"] == 1
+        assert props["ftw:scale_version"] == "ftw-scale-v1"
+
     def test_warns_without_license(self, tmp_path: Path) -> None:
         messages: list[str] = []
         build_catalog(tmp_path, on_progress=messages.append)

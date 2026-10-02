@@ -12,6 +12,7 @@ from ftw_dataset_tools.commands.create_dataset_summary import create_dataset_sum
 from ftw_dataset_tools.commands.create_ftw_grid import create_ftw_grid
 from ftw_dataset_tools.commands.create_masks import create_masks
 from ftw_dataset_tools.commands.create_splits import create_splits
+from ftw_dataset_tools.commands.create_subset import create_subset
 from ftw_dataset_tools.commands.download_images import download_images
 from ftw_dataset_tools.commands.get_grid import get_grid
 from ftw_dataset_tools.commands.inspect_fields import inspect_fields
@@ -44,6 +45,7 @@ cli.add_command(create_dataset_summary)
 cli.add_command(create_ftw_grid)
 cli.add_command(create_masks)
 cli.add_command(create_splits)
+cli.add_command(create_subset)
 cli.add_command(download_images)
 cli.add_command(get_grid)
 cli.add_command(inspect_fields)

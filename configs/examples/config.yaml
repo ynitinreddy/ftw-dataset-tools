@@ -76,8 +76,15 @@ stages:
     # match grid_file when that grid was not built at 2 km.
     km_size: 2.0
 
+  scale:
+    # Percent of 3x3 chip blocks to keep, chosen by a stable hash; smaller scales
+    # are subsets of larger ones. 100 skips the stage.
+    percent: 100
+    # Blocks always kept per MGRS 100 km square.
+    min_blocks_per_square: 1
+
   splits:
-    # One of: block3x3, predefined, random-uniform.
+    # One of: block3x3, block3x3-hash, predefined, random-uniform.
     split_type: random-uniform
     # Train / val / test percentages (must sum to 100).
     split_percents: [80, 10, 10]

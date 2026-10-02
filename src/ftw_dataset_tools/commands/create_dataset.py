@@ -7,7 +7,7 @@ from pathlib import Path
 
 import click
 
-from ftw_dataset_tools.api import chip_borders, crop_stats, dataset, masks, splits
+from ftw_dataset_tools.api import chip_borders, crop_stats, dataset, masks, scale, splits
 from ftw_dataset_tools.api.assets import MaskReadError
 from ftw_dataset_tools.api.config import DEFAULT_MASK_TYPES, PMTILES_AUTO, VALID_MASK_TYPES
 from ftw_dataset_tools.api.imagery import (
@@ -39,7 +39,8 @@ from ftw_dataset_tools.api.stac import detect_datetime_column, get_year_from_dat
     required=True,
     help=(
         "Dataset train/val/test split strategy. "
-        "Use 'block3x3' for spatially coherent 3x3 blocks, or "
+        "Use 'block3x3' for spatially coherent 3x3 blocks, "
+        "'block3x3-hash' for blocks that keep their split across scales, or "
         "'random-uniform' for random chip assignment across the dataset, or "
         "'predefined' to use a split column from the input fields file. "
         f"Available choices: {splits.SPLIT_TYPE_CHOICES_STR}."
@@ -197,6 +198,21 @@ from ftw_dataset_tools.api.stac import detect_datetime_column, get_year_from_dat
     help="How wide an unlabelled gap must be, in chips, before it counts as a cluster edge.",
 )
 @click.option(
+    "--scale-percent",
+    type=click.FloatRange(0, 100),
+    default=scale.DEFAULT_SCALE_PERCENT,
+    show_default=True,
+    help="Percent of 3x3 chip blocks to keep, chosen by a stable hash so smaller scales "
+    "are subsets of larger ones.",
+)
+@click.option(
+    "--scale-min-blocks",
+    type=click.IntRange(min=0),
+    default=scale.DEFAULT_MIN_BLOCKS_PER_SQUARE,
+    show_default=True,
+    help="Blocks always kept per MGRS 100 km square when --scale-percent is below 100.",
+)
+@click.option(
     "--class-filter",
     "class_filter",
     type=click.Path(exists=True),
@@ -238,6 +254,8 @@ def create_dataset_cmd(
     presence_only: bool,
     drop_border_chips: bool,
     border_gap_chips: int,
+    scale_percent: float,
+    scale_min_blocks: int,
     class_filter: str | None,
     checksums: bool,
 ) -> None:
@@ -443,6 +461,8 @@ def create_dataset_cmd(
             border_gap_chips=border_gap_chips,
             class_filter=class_filter,
             checksums=checksums,
+            scale_percent=scale_percent,
+            scale_min_blocks=scale_min_blocks,
             on_imagery=select_and_download if should_select_images else None,
             on_progress=on_progress,
             on_mask_progress=on_mask_progress,

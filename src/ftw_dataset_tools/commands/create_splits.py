@@ -14,8 +14,16 @@ from ftw_dataset_tools.api import splits
     help=(
         "Split strategy. 'random-uniform': randomly assign individual chips. "
         "'block3x3': group chips into 3x3 spatial blocks and randomly assign blocks. "
+        "'block3x3-hash': assign 3x3 blocks by a stable hash, so a block keeps its split "
+        "across scales. "
         "'predefined': use a split column from the fields file."
     ),
+)
+@click.option(
+    "--km-size",
+    type=click.FloatRange(min=1),
+    default=None,
+    help="Grid cell size in km for block split types. Inferred from chip IDs if omitted.",
 )
 @click.option(
     "--fields-file",
@@ -44,6 +52,7 @@ def create_splits(
     split_percents: tuple[int, int, int],
     random_seed: int,
     fields_file: str | None,
+    km_size: float | None,
 ) -> None:
     """Assign train/val/test splits to a chips file.
 
@@ -93,6 +102,7 @@ def create_splits(
             random_seed=random_seed,
             fields_file=fields_file,
             on_progress=lambda msg: click.echo(msg),
+            km_size=km_size,
         )
 
         click.echo()

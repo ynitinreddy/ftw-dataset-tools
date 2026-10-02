@@ -9,7 +9,7 @@ Intermediate outputs live in the output directory under a fixed naming
 convention, so any stage can be re-run on its own as long as its inputs exist:
 
     {output_dir}/{name}_fields.parquet          (reproject)
-    {output_dir}/{name}_chips.parquet           (chips, splits)
+    {output_dir}/{name}_chips.parquet           (chips, scale, splits)
     {output_dir}/{name}_boundary_lines.parquet  (boundaries)
     {output_dir}/collection.json                 (stac)
     {output_dir}/chips/<mgrs100k>/<item_id>/     (masks, stac, imagery)
@@ -32,6 +32,7 @@ from ftw_dataset_tools.api import (
     docs,
     field_stats,
     masks,
+    scale,
     splits,
     stac,
     styles,
@@ -70,6 +71,7 @@ STAGE_ORDER = [
     "reproject",
     "filter",
     "chips",
+    "scale",
     "splits",
     "boundaries",
     "masks",
@@ -161,6 +163,7 @@ class PipelineContext:
     source_crs: str | None = None
     chips_result: field_stats.FieldStatsResult | None = None
     crop_stats_result: crop_stats.CropStatsResult | None = None
+    scale_result: scale.ScaleResult | None = None
     splits_result: splits.CreateSplitsResult | None = None
     boundaries_result: boundaries.CreateBoundariesResult | None = None
     masks_results: dict[str, masks.CreateMasksResult] = field(default_factory=dict)
@@ -377,6 +380,8 @@ def resolve_stages(
 def _stage_enabled(stage: str, config: DatasetConfig) -> bool:
     if stage == "filter":
         return config.class_filter is not None
+    if stage == "scale":
+        return config.stages.scale.percent < 100
     if stage == "select_images":
         return config.stages.select_images.enabled
     if stage == "download_images":
@@ -581,6 +586,22 @@ def stage_chips(ctx: PipelineContext) -> None:
         crop_stats.drop_crop_stats(ctx.chips_path)
 
 
+def stage_scale(ctx: PipelineContext) -> None:
+    """Keep the configured percent of chip blocks and record each chip's scale score."""
+    _require(ctx.chips_path, stage="scale", produced_by="chips")
+    scale_cfg = ctx.config.stages.scale
+    ctx.scale_result = scale.apply_scale(
+        ctx.chips_path,
+        percent=scale_cfg.percent,
+        min_blocks_per_square=scale_cfg.min_blocks_per_square,
+        km_size=ctx.config.stages.chips.km_size,
+    )
+    ctx.log(
+        f"Scale {scale_cfg.percent:g}%: kept {ctx.scale_result.kept_chips:,} of "
+        f"{ctx.scale_result.total_chips:,} chips"
+    )
+
+
 def stage_splits(ctx: PipelineContext) -> None:
     """Assign train/val/test splits to the chips file."""
     _require(ctx.chips_path, stage="splits", produced_by="chips")
@@ -593,6 +614,7 @@ def stage_splits(ctx: PipelineContext) -> None:
         random_seed=split_cfg.random_seed,
         fields_file=str(ctx.field_polygons_path),
         on_progress=ctx.log,
+        km_size=ctx.config.stages.chips.km_size,
     )
 
 
@@ -911,6 +933,7 @@ _STAGE_FUNCS: dict[str, Callable[[PipelineContext], None]] = {
     "reproject": stage_reproject,
     "filter": stage_filter,
     "chips": stage_chips,
+    "scale": stage_scale,
     "splits": stage_splits,
     "boundaries": stage_boundaries,
     "masks": stage_masks,

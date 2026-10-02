@@ -51,7 +51,7 @@ class CropStatsResult:
     reason: str | None = None
 
 
-def _write_chips(chips_path: Path, con: duckdb.DuckDBPyConnection, query: str) -> None:
+def write_chips(chips_path: Path, con: duckdb.DuckDBPyConnection, query: str) -> None:
     """Write ``query`` over the chips GeoParquet through a temp file and a rename.
 
     The chips file is both the input and the output of this module, and it is the
@@ -124,7 +124,7 @@ def drop_crop_stats(chips_file: Path | str) -> bool:
     ensure_spatial_loaded(con)
     try:
         con.execute(f"CREATE TABLE chips_table AS {_select_without_crop_stats(chips_path)}")
-        _write_chips(chips_path, con, "SELECT * FROM chips_table")
+        write_chips(chips_path, con, "SELECT * FROM chips_table")
     finally:
         con.close()
     return True
@@ -392,7 +392,7 @@ def add_crop_stats(
             top_n=top_n,
             batch_size=batch_size,
         )
-        _write_chips(chips_path, con, "SELECT * FROM composed")
+        write_chips(chips_path, con, "SELECT * FROM composed")
     finally:
         con.close()
 

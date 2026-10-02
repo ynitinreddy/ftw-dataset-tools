@@ -237,10 +237,12 @@ class TestCreateDatasetStageOrder:
             on_imagery=lambda _collection_dir: seen.append("imagery"),
         )
 
-        # The stages themselves keep STAGE_ORDER; from_kwargs disables filter and the
-        # imagery stages, which the hook stands in for.
+        # The stages themselves keep STAGE_ORDER; from_kwargs disables filter, scale (at
+        # 100%) and the imagery stages, which the hook stands in for.
         assert [s for s in seen if s != "imagery"] == [
-            s for s in pipeline.STAGE_ORDER if s != "filter" and s not in pipeline.IMAGERY_STAGES
+            s
+            for s in pipeline.STAGE_ORDER
+            if s not in ("filter", "scale") and s not in pipeline.IMAGERY_STAGES
         ]
         assert seen.index("stac") < seen.index("imagery") < seen.index("docs")
 
@@ -266,3 +268,27 @@ class TestCreateDatasetStageOrder:
         )
 
         assert "docs" in seen and "imagery" not in seen
+
+    def test_scale_runs_between_chips_and_splits(self, monkeypatch, tmp_path: Path) -> None:
+        from ftw_dataset_tools.api import dataset as dataset_module
+        from ftw_dataset_tools.api import pipeline
+
+        fields_path = tmp_path / "f.parquet"
+        gpd.GeoDataFrame({"id": [1]}, geometry=[box(0, 0, 1, 1)], crs="EPSG:4326").to_parquet(
+            fields_path
+        )
+        seen: list[str] = []
+        for name in pipeline.STAGE_ORDER:
+            monkeypatch.setitem(
+                pipeline._STAGE_FUNCS, name, lambda _ctx, name=name: seen.append(name)
+            )
+
+        dataset_module.create_dataset(
+            fields_file=fields_path,
+            output_dir=tmp_path / "out",
+            split_type="block3x3-hash",
+            year=2024,
+            scale_percent=10,
+        )
+
+        assert seen.index("chips") < seen.index("scale") < seen.index("splits")

@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any
 import yaml
 
 from ftw_dataset_tools import __version__
-from ftw_dataset_tools.api import field_stats, splits
+from ftw_dataset_tools.api import field_stats, scale, splits
 from ftw_dataset_tools.api.chip_borders import DEFAULT_BORDER_GAP_CHIPS
 from ftw_dataset_tools.api.imagery.parallel import MAX_WORKERS
 
@@ -276,6 +276,14 @@ class ChipsConfig:
 
 
 @dataclass
+class ScaleConfig:
+    """Settings for the scale stage (nested, hash-based chip subsets)."""
+
+    percent: float = scale.DEFAULT_SCALE_PERCENT
+    min_blocks_per_square: int = scale.DEFAULT_MIN_BLOCKS_PER_SQUARE
+
+
+@dataclass
 class SplitsConfig:
     """Settings for the train/val/test split stage."""
 
@@ -483,6 +491,7 @@ class StagesConfig:
     """Per-stage settings. Stages with no options (boundaries) still run."""
 
     chips: ChipsConfig = field(default_factory=ChipsConfig)
+    scale: ScaleConfig = field(default_factory=ScaleConfig)
     splits: SplitsConfig = field(default_factory=SplitsConfig)
     masks: MasksConfig = field(default_factory=MasksConfig)
     select_images: SelectImagesConfig = field(default_factory=SelectImagesConfig)
@@ -578,6 +587,8 @@ class DatasetConfig:
         presence_only: bool,
         drop_border_chips: bool,
         border_gap_chips: int = DEFAULT_BORDER_GAP_CHIPS,
+        scale_percent: float = scale.DEFAULT_SCALE_PERCENT,
+        scale_min_blocks: int = scale.DEFAULT_MIN_BLOCKS_PER_SQUARE,
     ) -> DatasetConfig:
         """Build a config from ``create_dataset`` keyword arguments.
 
@@ -597,6 +608,7 @@ class DatasetConfig:
                     drop_border_chips=drop_border_chips,
                     border_gap_chips=border_gap_chips,
                 ),
+                scale=ScaleConfig(percent=scale_percent, min_blocks_per_square=scale_min_blocks),
                 splits=SplitsConfig(split_type=split_type, split_percents=split_percents),
                 masks=MasksConfig(
                     mask_types=list(mask_types)
@@ -638,6 +650,11 @@ class DatasetConfig:
         except ValueError as err:
             raise ConfigError(f"Invalid split_percents: {err}") from err
         self.stages.splits.split_percents = resolved
+
+        try:
+            scale.validate_scale(self.stages.scale.percent, self.stages.scale.min_blocks_per_square)
+        except ValueError as err:
+            raise ConfigError(f"Invalid stages.scale: {err}") from err
 
         for mask_type in self.stages.masks.mask_types:
             if mask_type not in VALID_MASK_TYPES:
@@ -853,6 +870,7 @@ def _as_str_list(value: Any, key: str, source: Path) -> list[str]:
 
 _STAGE_TYPES: dict[str, type] = {
     "chips": ChipsConfig,
+    "scale": ScaleConfig,
     "splits": SplitsConfig,
     "masks": MasksConfig,
     "select_images": SelectImagesConfig,
