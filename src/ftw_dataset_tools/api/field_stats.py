@@ -55,12 +55,16 @@ DEFAULT_CHIP_KM_SIZE = 2.0
 # full cell and rejects every truncated one.
 DEFAULT_MIN_CHIP_AREA = 99.5
 
+# Minimum field coverage for a chip to be kept, on the 0-100 scale of field_coverage_pct.
+DEFAULT_MIN_COVERAGE = 1.0
+
 # Re-export for convenience
 __all__ = [
     "DEFAULT_CHIP_KM_SIZE",
     "DEFAULT_COVERAGE_BATCH_SIZE",
     "DEFAULT_FTW_GRID_SOURCE",
     "DEFAULT_MIN_CHIP_AREA",
+    "DEFAULT_MIN_COVERAGE",
     "CRSMismatchError",
     "FieldStatsResult",
     "add_field_stats",
